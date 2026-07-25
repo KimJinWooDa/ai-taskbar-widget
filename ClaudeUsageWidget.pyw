@@ -1376,6 +1376,11 @@ class TrayApp:
 
     def _build_menu(self):
         import pystray
+        # 진단 항목은 평소엔 숨긴다 — CLAUDE_WIDGET_DEBUG=1 일 때만 보인다
+        dbg = []
+        if os.environ.get("CLAUDE_WIDGET_DEBUG"):
+            dbg = [pystray.MenuItem("토큰 갱신 테스트 (진단)",
+                                    lambda i, it: self.q.put(("reftest",)))]
         upd = []
         if self.update_info:
             upd = [pystray.MenuItem(f"새 버전 v{self.update_info[0]} 설치…",
@@ -1385,8 +1390,7 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             *upd,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
-            pystray.MenuItem("토큰 갱신 테스트 (진단)",
-                             lambda i, it: self.q.put(("reftest",))),
+            *dbg,
             pystray.MenuItem("장수 토큰 등록 (클립보드에서)",
                              lambda i, it: self.q.put(("token",)),
                              checked=lambda it: bool(self.cfg.get("setup_token"))),
