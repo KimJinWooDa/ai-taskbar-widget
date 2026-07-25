@@ -247,6 +247,29 @@ _tok_sig = None
 _mem_oauth = {}     # 마지막 갱신 결과 — 파일 쓰기가 실패해도 체인이 안 끊기게
 
 
+_shape_logged = False
+
+
+def _log_cred_shape(oauth):
+    """자격증명의 필드 이름과 만료 시각만 1회 기록 — 리프레시 토큰 수명 진단용.
+
+    토큰 값이나 계정 정보는 절대 남기지 않는다 (이름과 타임스탬프뿐).
+    """
+    global _shape_logged
+    if _shape_logged:
+        return
+    _shape_logged = True
+    exps = []
+    for k, v in sorted(oauth.items()):
+        if "xpires" in k.lower() and isinstance(v, (int, float)):
+            try:
+                exps.append(f"{k}=" + datetime.datetime.fromtimestamp(
+                    v / 1000).isoformat(" ", "minutes"))
+            except (ValueError, OSError, OverflowError):
+                exps.append(f"{k}={v}")
+    log.info("cred fields: [%s] %s", ",".join(sorted(oauth)), "; ".join(exps))
+
+
 def get_access_token(force_refresh=False):
     global _mem_oauth
     with _refresh_lock:
@@ -270,6 +293,7 @@ def get_access_token(force_refresh=False):
             except (TypeError, ValueError, OSError, OverflowError):
                 when = str(exp)
             log.info("cred token %s... expires %s", (token or "")[:11], when)
+            _log_cred_shape(oauth)
         if not force_refresh and token and \
                 oauth.get("expiresAt", 0) > time.time() * 1000 + 120_000:
             return token
