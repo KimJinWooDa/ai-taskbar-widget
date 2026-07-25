@@ -24,14 +24,16 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
 CRED_PATH = os.path.join(HOME, ".claude", ".credentials.json")
 USAGE_FILE = os.path.join(HOME, ".claude", "usage-widget.json")
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+# 2026-07 이전에는 console.anthropic.com이었다. 옮겨간 뒤로 옛 주소는 404
+# not_found_error를 돌려줘 "토큰이 죽었다"처럼 보였다 — 실제로는 문 자체가 없었다.
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLI_UA = "claude-cli/2.1.207 (external, cli)"
 API_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS = {"User-Agent": CLI_UA, "anthropic-beta": "oauth-2025-04-20"}
@@ -1049,6 +1051,26 @@ class TrayApp:
             return True
         return False
 
+    def _refresh_test(self):
+        """리프레시 체인이 살아 있는지 지금 확인 — 토큰이 멀쩡할 때 강제 갱신.
+
+        성공하면 위젯을 상시 실행해 체인을 이어갈 수 있다는 뜻이고,
+        실패하면 이 계정에서 갱신 경로 자체가 죽은 것이라 다른 방법이 필요하다.
+        """
+        try:
+            get_access_token(force_refresh=True)
+            log.info("refresh test: OK - chain alive")
+            note = "토큰 갱신 성공 — 자동 유지 가능"
+        except Exception as e:
+            log.info("refresh test: FAILED - %s", e)
+            note = f"토큰 갱신 실패 — {e}"
+        try:
+            self.icon.notify(note, "Claude 사용량")
+        except Exception:
+            pass
+        self.force_api.set()
+        self.wake.set()
+
     def _save_cache(self):
         try:
             tmp = CACHE_PATH + ".tmp"
@@ -1326,6 +1348,8 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             *upd,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
+            pystray.MenuItem("토큰 갱신 테스트 (진단)",
+                             lambda i, it: self.q.put(("reftest",))),
             pystray.MenuItem("장수 토큰 등록 (클립보드에서)",
                              lambda i, it: self.q.put(("token",)),
                              checked=lambda it: bool(self.cfg.get("setup_token"))),
@@ -1399,6 +1423,9 @@ class TrayApp:
             elif kind == "refresh":
                 self.force_api.set()
                 self.wake.set()
+            elif kind == "reftest":
+                threading.Thread(target=self._refresh_test,
+                                 daemon=True).start()
             elif kind == "token":
                 tok = ""
                 try:
