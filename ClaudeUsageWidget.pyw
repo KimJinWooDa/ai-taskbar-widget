@@ -247,7 +247,7 @@ _tok_sig = None
 _mem_oauth = {}     # 마지막 갱신 결과 — 파일 쓰기가 실패해도 체인이 안 끊기게
 
 
-_shape_logged = False
+_shape_logged = object()    # 마지막으로 기록한 리프레시 토큰 만료값
 
 
 def _log_cred_shape(oauth):
@@ -256,9 +256,9 @@ def _log_cred_shape(oauth):
     토큰 값이나 계정 정보는 절대 남기지 않는다 (이름과 타임스탬프뿐).
     """
     global _shape_logged
-    if _shape_logged:
-        return
-    _shape_logged = True
+    if _shape_logged == oauth.get("refreshTokenExpiresAt"):
+        return          # 리프레시 창이 움직였을 때만 다시 기록
+    _shape_logged = oauth.get("refreshTokenExpiresAt")
     exps = []
     for k, v in sorted(oauth.items()):
         if "xpires" in k.lower() and isinstance(v, (int, float)):
@@ -342,6 +342,19 @@ def get_access_token(force_refresh=False):
             "expiresAt": int(time.time() * 1000)
                          + int(t.get("expires_in", 3600)) * 1000,
         }
+        # 서버가 리프레시 토큰 수명도 알려주면 파일에 반영한다 — 갱신할 때마다
+        # 이 창이 새로 열리는지가 "재로그인이 정말 끝났는가"를 가른다.
+        for key in ("refresh_token_expires_in", "refresh_expires_in"):
+            if isinstance(t.get(key), (int, float)):
+                when = int(time.time() * 1000) + int(t[key]) * 1000
+                # 이 파일은 CLI도 읽는다 — 초/밀리초를 잘못 해석한 값을 쓰면
+                # CLI가 멀쩡한 토큰을 만료로 볼 수 있으니 상식 범위만 기록
+                if time.time() * 1000 < when < (time.time() + 400 * 86400) * 1000:
+                    _mem_oauth["refreshTokenExpiresAt"] = when
+                break
+        log.info("token response: [%s]%s", ",".join(sorted(t)),
+                 "".join(f" {k}={v}" for k, v in sorted(t.items())
+                         if isinstance(v, (int, float))))
         creds = {}
         try:
             with open(CRED_PATH, encoding="utf-8") as f:
