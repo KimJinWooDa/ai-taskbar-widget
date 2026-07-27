@@ -12,7 +12,6 @@ Claude 사용량 트레이 아이콘 v2 — 시계 옆에 사용률(%)을 항상
 import ctypes
 import ctypes.wintypes
 import json
-import math
 import os
 import re
 import sys
@@ -25,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.11.0"
+__version__ = "2.12.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -542,36 +541,38 @@ def demote_tray_icon():
 
 
 # ---------------------------------------------------------------- 아이콘
-def draw_claude_mark(d, cx, cy, r, fill, rays=8):
-    """Claude를 상징하는 방사형 버스트.
-
-    로고는 가는 살이 11개지만 트레이는 16px까지 줄어들어 그대로 두면 뭉갠다.
-    살을 8개로 줄이고 두툼하게 그려야 작은 크기에서 형태가 남는다.
-    """
-    step = math.pi * 2 / rays
-    for i in range(rays):
-        a = step * i - math.pi / 2
-        half = step / 2
-        d.polygon([
-            (cx + r * 0.32 * math.cos(a), cy + r * 0.32 * math.sin(a)),
-            (cx + r * 0.40 * math.cos(a - half),
-             cy + r * 0.40 * math.sin(a - half)),
-            (cx + r * math.cos(a), cy + r * math.sin(a)),
-            (cx + r * 0.40 * math.cos(a + half),
-             cy + r * 0.40 * math.sin(a + half)),
-        ], fill=fill)
-    d.ellipse([cx - r * 0.32, cy - r * 0.32, cx + r * 0.32, cy + r * 0.32],
-              fill=fill)
+# Claude 마스코트 "Clawd" — 12x8 픽셀 스프라이트 (o=몸통, x=눈, .=투명).
+# 트레이는 16px까지 줄어들어 로고의 가는 살은 뭉개지지만, 이 격자는 살아남는다.
+CLAWD = (
+    "..oooooooo..",
+    "..oxooooxo..",
+    "oooooooooooo",
+    "oooooooooooo",
+    "..oooooooo..",
+    "..oooooooo..",
+    "..o.o..o.o..",
+    "..o.o..o.o..",
+)
+CLAWD_BODY = "#d97757"
+CLAWD_EYE = "#1c1917"
 
 
 def make_icon_image(pct):
-    """상태색 타일 위에 Claude 마크. 숫자는 바와 메뉴에서 본다."""
+    """Clawd + 아래쪽 상태색 띠. 숫자는 플로팅 바와 메뉴에서 본다."""
     from PIL import Image, ImageDraw
-    n = 128
+    n, s = 128, 10          # 128 = 16*8 — 트레이가 줄여도 격자가 덜 깨진다
     img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([4, 4, n - 4, n - 4], radius=28, fill=severity_color(pct))
-    draw_claude_mark(d, n // 2, n // 2, n * 0.41, "#ffffff")
+    x0, y0 = (n - len(CLAWD[0]) * s) // 2, 6
+    for y, row in enumerate(CLAWD):
+        for x, ch in enumerate(row):
+            if ch == ".":
+                continue
+            d.rectangle([x0 + x * s, y0 + y * s,
+                         x0 + (x + 1) * s - 1, y0 + (y + 1) * s - 1],
+                        fill=CLAWD_EYE if ch == "x" else CLAWD_BODY)
+    d.rounded_rectangle([8, n - 30, n - 8, n - 6], radius=10,
+                        fill=severity_color(pct))
     return img
 
 
