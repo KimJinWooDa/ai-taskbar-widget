@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.12.0"
+__version__ = "2.13.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -44,6 +44,8 @@ API_INTERVAL_IDLE = 600         # 유휴일 때 — 서버 호출 한도를 아�
 ACTIVE_WINDOW = 300             # 최근 5분 내 전사 갱신 = 대화 중
 EVENT_MIN_GAP = 90              # 답변 직후 조회의 최소 간격
 API_INTERVAL_DENIED = 30 * 60
+BLINK_EVERY = 9                 # 초 — 이 간격으로 한 번씩 눈을 깜빡인다
+BLINK_HOLD = 0.13               # 감고 있는 시간. 계속 움직이면 CPU를 먹는다
 SINGLETON_PORT = 53917
 
 REPO = "KimJinWooDa/claude-taskbar-widget"
@@ -557,22 +559,34 @@ CLAWD_BODY = "#d97757"
 CLAWD_EYE = "#1c1917"
 
 
-def make_icon_image(pct):
-    """Clawd + 아래쪽 상태색 띠. 숫자는 플로팅 바와 메뉴에서 본다."""
+_icon_cache = {}
+
+
+def make_icon_image(pct, blink=False):
+    """Clawd + 아래쪽 상태색 띠. 숫자는 플로팅 바와 메뉴에서 본다.
+
+    같은 그림을 매번 다시 그리지 않게 (색, 눈 상태)로 캐시한다 —
+    깜빡임이 트레이 갱신 비용을 늘리지 않도록.
+    """
+    key = (severity_color(pct), blink)
+    img = _icon_cache.get(key)
+    if img is not None:
+        return img
     from PIL import Image, ImageDraw
-    n, s = 128, 10          # 128 = 16*8 — 트레이가 줄여도 격자가 덜 깨진다
+    n, s = 160, 13          # 스프라이트 156x104 — 트레이 칸을 거의 꽉 채운다
     img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    x0, y0 = (n - len(CLAWD[0]) * s) // 2, 6
+    x0, y0 = (n - len(CLAWD[0]) * s) // 2, 2
     for y, row in enumerate(CLAWD):
         for x, ch in enumerate(row):
             if ch == ".":
                 continue
+            eye = ch == "x" and not blink        # 깜빡일 땐 눈만 몸통색으로
             d.rectangle([x0 + x * s, y0 + y * s,
                          x0 + (x + 1) * s - 1, y0 + (y + 1) * s - 1],
-                        fill=CLAWD_EYE if ch == "x" else CLAWD_BODY)
-    d.rounded_rectangle([8, n - 30, n - 8, n - 6], radius=10,
-                        fill=severity_color(pct))
+                        fill=CLAWD_EYE if eye else CLAWD_BODY)
+    d.rounded_rectangle([16, 128, n - 16, 148], radius=10, fill=key[0])
+    _icon_cache[key] = img
     return img
 
 
@@ -1526,6 +1540,20 @@ class TrayApp:
         p = [x[1] for x in self.rows if x[1] is not None]
         return max(p) if p else None
 
+    def _blink(self):
+        """가끔 눈 한 번 깜빡. 두 장 다 캐시라 그리는 비용은 없다."""
+        if not self.icon:
+            return
+        try:
+            pct = self._worst()
+            self.icon.icon = make_icon_image(pct, blink=True)
+            time.sleep(BLINK_HOLD)
+            self.icon.icon = make_icon_image(pct)
+            if os.environ.get("CLAUDE_WIDGET_DEBUG"):
+                log.info("blink")
+        except Exception as e:
+            log.error("blink failed: %s", e)
+
     def _refresh_tray(self):
         if not self.icon:
             return
@@ -1555,13 +1583,18 @@ class TrayApp:
         FloatingBar(self).start()
 
         last_tray = 0.0
+        next_blink = time.time() + BLINK_EVERY
         while not self.stop_evt.is_set():
             try:
                 msg = self.q.get(timeout=1.0)
             except queue.Empty:
-                if self.rows and time.time() - last_tray >= 30:
-                    last_tray = time.time()
+                now = time.time()
+                if self.rows and now - last_tray >= 30:
+                    last_tray = now
                     self._refresh_tray()   # 남은 시간 표시 갱신 (분 단위면 충분)
+                if now >= next_blink:
+                    next_blink = now + BLINK_EVERY
+                    self._blink()
                 continue
             kind = msg[0]
             if kind == "data":
