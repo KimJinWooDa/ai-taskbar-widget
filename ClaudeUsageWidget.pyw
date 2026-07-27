@@ -12,6 +12,7 @@ Claude 사용량 트레이 아이콘 v2 — 시계 옆에 사용률(%)을 항상
 import ctypes
 import ctypes.wintypes
 import json
+import math
 import os
 import re
 import sys
@@ -24,7 +25,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.10.0"
+__version__ = "2.11.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -541,20 +542,36 @@ def demote_tray_icon():
 
 
 # ---------------------------------------------------------------- 아이콘
+def draw_claude_mark(d, cx, cy, r, fill, rays=8):
+    """Claude를 상징하는 방사형 버스트.
+
+    로고는 가는 살이 11개지만 트레이는 16px까지 줄어들어 그대로 두면 뭉갠다.
+    살을 8개로 줄이고 두툼하게 그려야 작은 크기에서 형태가 남는다.
+    """
+    step = math.pi * 2 / rays
+    for i in range(rays):
+        a = step * i - math.pi / 2
+        half = step / 2
+        d.polygon([
+            (cx + r * 0.32 * math.cos(a), cy + r * 0.32 * math.sin(a)),
+            (cx + r * 0.40 * math.cos(a - half),
+             cy + r * 0.40 * math.sin(a - half)),
+            (cx + r * math.cos(a), cy + r * math.sin(a)),
+            (cx + r * 0.40 * math.cos(a + half),
+             cy + r * 0.40 * math.sin(a + half)),
+        ], fill=fill)
+    d.ellipse([cx - r * 0.32, cy - r * 0.32, cx + r * 0.32, cy + r * 0.32],
+              fill=fill)
+
+
 def make_icon_image(pct):
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    """상태색 타일 위에 Claude 마크. 숫자는 바와 메뉴에서 본다."""
+    from PIL import Image, ImageDraw
+    n = 128
+    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([2, 2, 62, 62], radius=14, fill=severity_color(pct))
-    text = "?" if pct is None else str(min(round(pct), 999))
-    size = 38 if len(text) <= 2 else 27
-    try:
-        font = ImageFont.truetype("arialbd.ttf", size)
-    except OSError:
-        font = ImageFont.load_default()
-    b = d.textbbox((0, 0), text, font=font)
-    d.text(((64 - b[2] - b[0]) / 2, (64 - b[3] - b[1]) / 2), text,
-           font=font, fill="#ffffff")
+    d.rounded_rectangle([4, 4, n - 4, n - 4], radius=28, fill=severity_color(pct))
+    draw_claude_mark(d, n // 2, n // 2, n * 0.41, "#ffffff")
     return img
 
 
@@ -717,9 +734,17 @@ class FloatingBar(threading.Thread):
 
     평상시 무채색, 70%↑ 주황·90%↑ 빨강만 색 표시. 드래그로 이동(위치 저장),
     우클릭 숨김, 트레이 메뉴에서 표시·잠금 토글. 잠금 시 클릭이 통과한다.
+    z순서는 작업표시줄에 맞춘다 — 소유자로 지정해 바로 위에 두고, topmost
+    여부까지 따라가서 전체화면 앱이 뜨면 작업표시줄과 함께 아래로 내려간다.
     """
 
-    LINES = 3               # 작업표시줄 48px에 13px 줄 3개 + 여백 6px
+    LINES = 3               # 작업표시줄 48px에 12px 줄 3개 + 여백 6px
+    FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
+    PAD = 8                 # 좌우 여백 — 모든 줄의 라벨이 여기서 시작한다
+    TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
+    CAMO_EVERY = 20         # 10초마다 배경 확인
+    ADOPT_EVERY = 120       # 60초마다 소유 관계 재확인
+    CAMO_MAX_AGE = 300      # 옆 픽셀이 그대로여도 이 시간이 지나면 한 번 다시 찍는다
     BG = "#1f1f1f"          # 첫 픽셀 샘플링 전까지의 임시 배경
     PAL_DARK = {"label": "#a6a6a6", "value": "#dcdcdc", "time": "#7a7a7a"}
     PAL_LIGHT = {"label": "#5f5f5f", "value": "#1f1f1f", "time": "#909090"}
@@ -744,9 +769,11 @@ class FloatingBar(threading.Thread):
         root = self.root = tk.Tk()
         root.withdraw()
         root.overrideredirect(True)
-        root.attributes("-topmost", True)
+        # topmost는 고정값이 아니라 작업표시줄을 따라간다(_sync_topmost).
+        # 소유 관계만으로는 위에 못 뜬다 — topmost 창은 별도 밴드라서
+        # 소유자가 topmost면 non-topmost 소유 창은 그 아래로 가라앉는다.
         root.configure(bg=self.BG)
-        f = self._font = tkfont.Font(family="맑은 고딕", size=8)
+        f = self._font = tkfont.Font(family="맑은 고딕", size=self.FONT_PX)
         self._fix_w = f.measure("주간 (모든 모델) 100%  · 16시간 59분 후") + 24
         self._fix_h = self.LINES * f.metrics("linespace") + 6
         self._shown = False
@@ -755,6 +782,8 @@ class FloatingBar(threading.Thread):
         self._rgb = None
         self._pending = None
         self._snip_active = False
+        self._recapture = False
+        self._camo_at = 0.0
         self._pal = self.PAL_DARK
         self._bgimg = None
         self._last = [None] * self.LINES
@@ -764,9 +793,14 @@ class FloatingBar(threading.Thread):
         self._img_item = cv.create_image(0, 0, anchor="nw")
         self._ys = tuple(self._fix_h * (2 * i + 1) // (2 * self.LINES)
                          for i in range(self.LINES))
-        self.items = [tuple(cv.create_text(8, y, anchor="w", font=f, text="",
-                                           fill=self._pal[k])
-                            for k in ("label", "value", "time"))
+        # 값은 오른쪽 정렬(anchor="e") — 9%·76%·100%의 끝이 한 줄로 맞고,
+        # 뒤따르는 시간도 세 줄이 같은 x에서 시작한다
+        self.items = [(cv.create_text(self.PAD, y, anchor="w", font=f, text="",
+                                      fill=self._pal["label"]),
+                       cv.create_text(self.PAD, y, anchor="e", font=f, text="",
+                                      fill=self._pal["value"]),
+                       cv.create_text(self.PAD, y, anchor="w", font=f, text="",
+                                      fill=self._pal["time"]))
                       for y in self._ys]
         self._lock_applied = None
         for w in (root, cv):
@@ -805,18 +839,67 @@ class FloatingBar(threading.Thread):
         except Exception:
             log.exception("adopt failed")
 
+    def _sync_topmost(self, raise_now=False):
+        """바의 topmost를 작업표시줄과 같게 맞추고, 평상시에만 위로 올린다.
+
+        전체화면 앱(영상·게임)이 뜨면 Windows가 작업표시줄의 topmost를 떼어
+        그 아래로 내린다. 바만 topmost로 남으면 화면 위에 혼자 떠 있으므로
+        같은 순간 따라 내려오고, 전체화면이 끝나면 함께 올라온다.
+        올리기는 작업표시줄이 topmost일 때만 — 전체화면 중에 올리면
+        영상 위로 다시 튀어나온다.
+        """
+        try:
+            u = ctypes.windll.user32
+            u.FindWindowW.restype = ctypes.c_void_p
+            u.GetWindow.restype = ctypes.c_void_p
+            tray = u.FindWindowW("Shell_TrayWnd", None)
+            if not tray:
+                return
+            want = bool(u.GetWindowLongW(ctypes.c_void_p(tray), -20) & 0x8)
+            hwnd = u.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            # 실제 상태를 매번 읽으므로 어긋나 있으면 스스로 복구된다
+            if bool(u.GetWindowLongW(hwnd, -20) & 0x8) != want:
+                u.SetWindowPos(ctypes.c_void_p(hwnd),
+                               ctypes.c_void_p(-1 if want else -2),
+                               0, 0, 0, 0, 0x0013)  # NOSIZE|NOMOVE|NOACTIVATE
+                raise_now = want    # 되돌아올 땐 위치까지 다시 잡는다
+                log.info("bar topmost -> %s", want)
+                if not want:
+                    # HWND_NOTOPMOST는 '모든 일반 창 위'로 올려버린다 —
+                    # 전체화면 앱 위로 튀어나오지 않게 작업표시줄 바로 위로 끼운다
+                    prev = u.GetWindow(ctypes.c_void_p(tray), 3)  # GW_HWNDPREV
+                    if prev and prev != hwnd:
+                        u.SetWindowPos(ctypes.c_void_p(hwnd),
+                                       ctypes.c_void_p(prev),
+                                       0, 0, 0, 0, 0x0013)
+            if raise_now and want:
+                u.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(0),
+                               0, 0, 0, 0, 0x0013)  # HWND_TOP — 작업표시줄 위로
+        except Exception:
+            log.exception("topmost sync failed")
+
     def _probe(self):
-        """바 왼쪽 옆 작업표시줄 픽셀 하나 — 배경이 바뀌었는지 감지용."""
+        """바 옆 작업표시줄 픽셀 몇 개의 평균 — 배경이 바뀌었는지 감지용.
+
+        한 점만 보면 그 점이 우연히 안 변한 스타일 변화(테마·미카 톤 변경)를
+        놓친다. 위·아래·좌우로 흩어 뽑아 평균을 내면 훨씬 잘 잡힌다.
+        """
         try:
             self.root.update_idletasks()    # geometry 반영 전 winfo_x()=0 방지
             u, g = ctypes.windll.user32, ctypes.windll.gdi32
+            x, y, h = self.root.winfo_x(), self.root.winfo_y(), self._fix_h
+            pts = [(x - 6, y + h // 2), (x - 18, y + 3), (x - 6, y + h - 3),
+                   (x + self._fix_w + 6, y + h // 2)]
             dc = u.GetDC(0)
-            c = g.GetPixel(dc, self.root.winfo_x() - 6,
-                           self.root.winfo_y() + self._fix_h // 2)
+            got = []
+            for px, py in pts:
+                c = g.GetPixel(dc, px, py)
+                if c >= 0:
+                    got.append((c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF))
             u.ReleaseDC(0, dc)
-            if c < 0:
+            if not got:
                 return None
-            return (c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF)
+            return tuple(sum(c[i] for c in got) // len(got) for i in range(3))
         except Exception:
             return None
 
@@ -826,8 +909,10 @@ class FloatingBar(threading.Thread):
         단색이 아니라 실제 조각(미카 그라데이션 포함)을 입히므로 경계가 없다.
         캡처하려면 바를 잠깐 숨겨야 해서, 옆 픽셀이 실제로 달라졌을 때만 다시 찍는다.
         """
-        if not force and self._snip_active:
+        if self._snip_active and self._bgimg is not None:
             return      # 캡처 오버레이로 어두워진 화면을 배경으로 찍으면 안 됨
+        if not force and time.time() - self._camo_at > self.CAMO_MAX_AGE:
+            force = True    # 옆 픽셀이 그대로여도 오래되면 한 번 다시 맞춘다
         rgb = self._probe()
         if rgb is None:
             return
@@ -860,12 +945,15 @@ class FloatingBar(threading.Thread):
             lum = 0.299 * r + 0.587 * gr + 0.114 * b
             self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
             self._last = [None] * self.LINES  # 새 팔레트로 텍스트 다시 그리기
+            self._camo_at = time.time()
             log.info("bar camo #%02x%02x%02x", r, gr, b)
         except Exception:
             log.exception("bg capture failed")
         finally:
             if was_shown:
                 self.root.deiconify()
+                self._adopt_by_taskbar()    # Tk가 map할 때 소유자를 지운다
+                self._sync_topmost(raise_now=True)
 
     def _value_color(self, pct):
         if pct >= 90:
@@ -956,64 +1044,84 @@ class FloatingBar(threading.Thread):
             self._update()
         except Exception:
             log.exception("bar update failed")
-        self.root.after(2000, self._tick)
+        self.root.after(self.TICK_MS, self._tick)
 
     def _update(self):
         self._ticks += 1
         if not self.app.cfg.get("bar_visible", True):
             self._show(False)
             return
-        covered, self._snip_active = _taskbar_covered()
+        covered, snip = _taskbar_covered()
+        if self._snip_active and not snip:
+            self._recapture = True  # 캡처가 끝났으면 그동안의 변화를 다시 입는다
+        self._snip_active = snip
+        self._sync_topmost()        # 전체화면이면 이 순간 바도 아래로 내려간다
         self._covered = self._covered + 1 if covered else 0
         if self._covered >= 2:      # 순간 오탐으로 깜빡이지 않게 2회 연속일 때만
             self._show(False)
             return
-        if self._ticks % 15 == 0:
-            self._match_background()
+        if self._recapture and not snip:
+            self._recapture = False
+            self._match_background(force=True)
+        elif self._ticks % self.CAMO_EVERY == 0:
+            self._match_background()    # 재촬영은 2회 연속 변했을 때만
         lines = self._pick()
         notice = self.app.auth_notice
+        cols = self._columns(lines)
         for idx, (title, row) in enumerate(lines):
             if idx == len(lines) - 1 and notice:    # 마지막 줄을 재발급 안내로
-                self._set_line(idx, "", notice, "", "#da3633")
+                self._set_line(idx, notice, "", "", "#da3633", cols,
+                               lcolor="#da3633")
             elif row:
                 pct, reset = row
                 t = short_reset(reset)
-                self._set_line(idx, f"{title} ", f"{round(pct)}%",
-                               f" · {t}" if t else "", self._value_color(pct))
+                self._set_line(idx, title, f"{round(pct)}%",
+                               f" · {t}" if t else "", self._value_color(pct),
+                               cols)
             else:
-                self._set_line(idx, "", "", "", self._pal["value"])
+                self._set_line(idx, "", "", "", self._pal["value"], cols)
         self._show(True)
         self._apply_lock()
 
-    def _set_line(self, idx, label, value, when, vcolor):
+    def _columns(self, lines):
+        """세 줄이 같은 열에 서도록 (값 오른쪽끝 x, 시간 시작 x)를 구한다."""
+        f = self._font
+        gap = f.measure(" ")
+        label_w = max([f.measure(t) for t, _ in lines] or [0])
+        value_w = max([f.measure(f"{round(r[0])}%") for _, r in lines if r]
+                      or [f.measure("100%")])
+        end = self.PAD + label_w + gap + value_w
+        return (end, end)
+
+    def _set_line(self, idx, label, value, when, vcolor, cols, lcolor=None):
         """실제로 달라졌을 때만 캔버스 텍스트를 다시 그린다."""
-        key = (label, value, when, vcolor, id(self._pal))
+        key = (label, value, when, vcolor, lcolor, cols, id(self._pal))
         if self._last[idx] == key:
             return
         self._last[idx] = key
         l, v, w = self.items[idx]
-        self.cv.itemconfigure(l, text=label, fill=self._pal["label"])
+        self.cv.itemconfigure(l, text=label, fill=lcolor or self._pal["label"])
         self.cv.itemconfigure(v, text=value, fill=vcolor)
         self.cv.itemconfigure(w, text=when, fill=self._pal["time"])
         y = self._ys[idx]
-        x = 8 + self._font.measure(label)
-        self.cv.coords(v, x, y)
-        self.cv.coords(w, x + self._font.measure(value), y)
+        self.cv.coords(l, self.PAD, y)
+        self.cv.coords(v, cols[0], y)      # 값은 오른쪽 정렬 — 끝이 맞는다
+        self.cv.coords(w, cols[1], y)
 
     def _show(self, on):
         """상태가 바뀔 때만 표시/숨김 — 매 틱 재표시로 인한 깜빡임 방지."""
         if on and not self._shown:
-            if self._bgimg is None:
-                self._match_background(force=True)  # 첫 표시 전에 위장 준비
+            # 숨어 있는 동안 아래가 바뀌었을 수 있다(전체화면 종료·테마 변경).
+            # 창이 아직 안 보이는 지금 찍으면 깜빡임 없이 새 배경을 입는다.
+            self._match_background(force=True)
             self.root.deiconify()
-            self.root.attributes("-topmost", True)
-            self.root.lift()
             self._adopt_by_taskbar()    # 표시 후에 걸어야 Tk가 안 지운다
+            self._sync_topmost(raise_now=True)
         elif not on and self._shown:
             self.root.withdraw()
-        elif on and self._ticks % 30 == 0:
-            self.root.lift()
+        elif on and self._ticks % self.ADOPT_EVERY == 0:
             self._adopt_by_taskbar()    # 연결이 풀린 경우를 위한 드문 보험
+            self._sync_topmost(raise_now=True)
         self._shown = on
 
 
