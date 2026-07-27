@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.13.0"
+__version__ = "2.14.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -555,7 +555,6 @@ CLAWD = (
     "..o.o..o.o..",
     "..o.o..o.o..",
 )
-CLAWD_BODY = "#d97757"
 CLAWD_EYE = "#1c1917"
 
 
@@ -563,7 +562,7 @@ _icon_cache = {}
 
 
 def make_icon_image(pct, blink=False):
-    """Clawd + 아래쪽 상태색 띠. 숫자는 플로팅 바와 메뉴에서 본다.
+    """Clawd. 몸 색이 곧 사용량 — 초록(여유)·주황(70%↑)·빨강(90%↑).
 
     같은 그림을 매번 다시 그리지 않게 (색, 눈 상태)로 캐시한다 —
     깜빡임이 트레이 갱신 비용을 늘리지 않도록.
@@ -573,10 +572,13 @@ def make_icon_image(pct, blink=False):
     if img is not None:
         return img
     from PIL import Image, ImageDraw
-    n, s = 160, 13          # 스프라이트 156x104 — 트레이 칸을 거의 꽉 채운다
+    # 96 = 12칸×8px, 동시에 16·24·32px의 정수배 — 트레이가 줄여도 덜 흐려진다.
+    # 띠를 없애고 가로를 꽉 채워야 캐릭터가 가장 크게 보인다(스프라이트가
+    # 12x8 가로형이라 정사각 아이콘에서 세로는 남을 수밖에 없다).
+    n, s = 96, 8
     img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    x0, y0 = (n - len(CLAWD[0]) * s) // 2, 2
+    x0, y0 = (n - len(CLAWD[0]) * s) // 2, (n - len(CLAWD) * s) // 2
     for y, row in enumerate(CLAWD):
         for x, ch in enumerate(row):
             if ch == ".":
@@ -584,8 +586,7 @@ def make_icon_image(pct, blink=False):
             eye = ch == "x" and not blink        # 깜빡일 땐 눈만 몸통색으로
             d.rectangle([x0 + x * s, y0 + y * s,
                          x0 + (x + 1) * s - 1, y0 + (y + 1) * s - 1],
-                        fill=CLAWD_EYE if eye else CLAWD_BODY)
-    d.rounded_rectangle([16, 128, n - 16, 148], radius=10, fill=key[0])
+                        fill=CLAWD_EYE if eye else key[0])
     _icon_cache[key] = img
     return img
 
