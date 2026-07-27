@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.15.0"
+__version__ = "2.16.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -761,6 +761,7 @@ class FloatingBar(threading.Thread):
     CAMO_EVERY = 20         # 10초마다 배경 확인
     ADOPT_EVERY = 120       # 60초마다 소유 관계 재확인
     CAMO_MAX_AGE = 300      # 옆 픽셀이 그대로여도 이 시간이 지나면 한 번 다시 찍는다
+    SIDE = 12               # 배경을 떠올 좌우 여백 폭
     BG = "#1f1f1f"          # 첫 픽셀 샘플링 전까지의 임시 배경
     PAL_DARK = {"label": "#a6a6a6", "value": "#dcdcdc", "time": "#7a7a7a"}
     PAL_LIGHT = {"label": "#5f5f5f", "value": "#1f1f1f", "time": "#909090"}
@@ -904,8 +905,10 @@ class FloatingBar(threading.Thread):
             self.root.update_idletasks()    # geometry 반영 전 winfo_x()=0 방지
             u, g = ctypes.windll.user32, ctypes.windll.gdi32
             x, y, h = self.root.winfo_x(), self.root.winfo_y(), self._fix_h
+            # 전부 바 왼쪽의 빈 구간에서 — 오른쪽은 트레이 아이콘이 가까워서
+            # 아이콘이 바뀔 때마다 배경을 다시 만들게 된다(60초마다 재촬영의 원인)
             pts = [(x - 6, y + h // 2), (x - 18, y + 3), (x - 6, y + h - 3),
-                   (x + self._fix_w + 6, y + h // 2)]
+                   (x - 30, y + h // 2)]
             dc = u.GetDC(0)
             got = []
             for px, py in pts:
@@ -920,10 +923,11 @@ class FloatingBar(threading.Thread):
             return None
 
     def _match_background(self, force=False):
-        """바 자리의 작업표시줄 픽셀을 통째로 캡처해 배경 이미지로 — 완전 위장.
+        """바 양옆 작업표시줄을 떠서 그 사이를 이어 붙여 배경으로 쓴다.
 
-        단색이 아니라 실제 조각(미카 그라데이션 포함)을 입히므로 경계가 없다.
-        캡처하려면 바를 잠깐 숨겨야 해서, 옆 픽셀이 실제로 달라졌을 때만 다시 찍는다.
+        예전에는 바를 잠깐 숨기고 그 자리를 찍었는데, 그 순간이 눈에 띄었다
+        (화면 캡처 직후처럼 다시 찍을 일이 겹치면 특히). 바가 놓인 구간은
+        아이콘이 없는 매끈한 자리라, 좌우 끝을 가로로 이어 붙이면 실제와 같다.
         """
         if self._snip_active and self._bgimg is not None:
             return      # 캡처 오버레이로 어두워진 화면을 배경으로 찍으면 안 됨
@@ -945,16 +949,28 @@ class FloatingBar(threading.Thread):
                 return
             self._pending = None
         self._rgb = rgb
-        was_shown = self._shown
         try:
-            from PIL import ImageGrab, ImageTk
-            if was_shown:
-                self.root.withdraw()
-                self.root.update()
-                time.sleep(0.06)        # 컴포지터가 창을 지울 시간
+            from PIL import Image, ImageGrab, ImageTk
             x, y = self.root.winfo_x(), self.root.winfo_y()
-            img = ImageGrab.grab(bbox=(x, y, x + self._fix_w,
-                                       y + self._fix_h), all_screens=True)
+            w, h, s = self._fix_w, self._fix_h, self.SIDE
+            x0 = max(x - s, 0)
+            x1 = min(x + w + s, self.root.winfo_screenwidth())
+            lw, rw = x - x0, x1 - (x + w)
+            if lw <= 0 and rw <= 0:
+                return
+            shot = ImageGrab.grab(bbox=(x0, y, x1, y + h),
+                                  all_screens=True).convert("RGB")
+            left = (shot.crop((0, 0, lw, h)).resize((w, h)) if lw > 0 else None)
+            right = (shot.crop((shot.width - rw, 0, shot.width, h))
+                     .resize((w, h)) if rw > 0 else None)
+            if left is None:
+                img = right
+            elif right is None:
+                img = left
+            else:
+                ramp = Image.new("L", (w, 1))
+                ramp.putdata([255 * i // max(w - 1, 1) for i in range(w)])
+                img = Image.composite(right, left, ramp.resize((w, h)))
             self._bgimg = ImageTk.PhotoImage(img)
             self.cv.itemconfigure(self._img_item, image=self._bgimg)
             r, gr, b = img.resize((1, 1)).getpixel((0, 0))[:3]
@@ -965,11 +981,6 @@ class FloatingBar(threading.Thread):
             log.info("bar camo #%02x%02x%02x", r, gr, b)
         except Exception:
             log.exception("bg capture failed")
-        finally:
-            if was_shown:
-                self.root.deiconify()
-                self._adopt_by_taskbar()    # Tk가 map할 때 소유자를 지운다
-                self._sync_topmost(raise_now=True)
 
     def _value_color(self, pct):
         if pct >= 90:
