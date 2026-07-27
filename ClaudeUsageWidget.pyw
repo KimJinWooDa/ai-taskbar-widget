@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.14.0"
+__version__ = "2.15.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -572,10 +572,10 @@ def make_icon_image(pct, blink=False):
     if img is not None:
         return img
     from PIL import Image, ImageDraw
-    # 96 = 12칸×8px, 동시에 16·24·32px의 정수배 — 트레이가 줄여도 덜 흐려진다.
-    # 띠를 없애고 가로를 꽉 채워야 캐릭터가 가장 크게 보인다(스프라이트가
-    # 12x8 가로형이라 정사각 아이콘에서 세로는 남을 수밖에 없다).
-    n, s = 96, 8
+    # 96은 16·24·32px의 정수배 — 트레이가 줄여도 픽셀이 덜 뭉개진다.
+    # s=10이면 스프라이트가 120x80이라 좌우 팔이 살짝 잘려 나가는 대신
+    # 세로를 83%까지 채운다(딱 맞추는 s=8은 67%라 아이콘이 작아 보였다).
+    n, s = 96, 10
     img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     x0, y0 = (n - len(CLAWD[0]) * s) // 2, (n - len(CLAWD) * s) // 2
