@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.9.0"
+__version__ = "2.10.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -713,12 +713,13 @@ def _taskbar_covered():
 
 
 class FloatingBar(threading.Thread):
-    """작업표시줄에 얹히는 투명 두 줄 바 (시안 B) — 1줄 세션, 2줄 Fable(없으면 주간).
+    """작업표시줄에 얹히는 투명 세 줄 바 (시안 B) — 세션 / 주간 / 모델별(Fable).
 
     평상시 무채색, 70%↑ 주황·90%↑ 빨강만 색 표시. 드래그로 이동(위치 저장),
     우클릭 숨김, 트레이 메뉴에서 표시·잠금 토글. 잠금 시 클릭이 통과한다.
     """
 
+    LINES = 3               # 작업표시줄 48px에 13px 줄 3개 + 여백 6px
     BG = "#1f1f1f"          # 첫 픽셀 샘플링 전까지의 임시 배경
     PAL_DARK = {"label": "#a6a6a6", "value": "#dcdcdc", "time": "#7a7a7a"}
     PAL_LIGHT = {"label": "#5f5f5f", "value": "#1f1f1f", "time": "#909090"}
@@ -747,7 +748,7 @@ class FloatingBar(threading.Thread):
         root.configure(bg=self.BG)
         f = self._font = tkfont.Font(family="맑은 고딕", size=8)
         self._fix_w = f.measure("주간 (모든 모델) 100%  · 16시간 59분 후") + 24
-        self._fix_h = 2 * f.metrics("linespace") + 8
+        self._fix_h = self.LINES * f.metrics("linespace") + 6
         self._shown = False
         self._covered = 0
         self._ticks = 0
@@ -756,12 +757,13 @@ class FloatingBar(threading.Thread):
         self._snip_active = False
         self._pal = self.PAL_DARK
         self._bgimg = None
-        self._last = [None, None]
+        self._last = [None] * self.LINES
         cv = self.cv = tk.Canvas(root, width=self._fix_w, height=self._fix_h,
                                  highlightthickness=0, bd=0, bg=self.BG)
         cv.pack()
         self._img_item = cv.create_image(0, 0, anchor="nw")
-        self._ys = (self._fix_h // 4 + 1, self._fix_h * 3 // 4 - 1)
+        self._ys = tuple(self._fix_h * (2 * i + 1) // (2 * self.LINES)
+                         for i in range(self.LINES))
         self.items = [tuple(cv.create_text(8, y, anchor="w", font=f, text="",
                                            fill=self._pal[k])
                             for k in ("label", "value", "time"))
@@ -857,7 +859,7 @@ class FloatingBar(threading.Thread):
             r, gr, b = img.resize((1, 1)).getpixel((0, 0))[:3]
             lum = 0.299 * r + 0.587 * gr + 0.114 * b
             self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
-            self._last = [None, None]   # 새 팔레트로 텍스트 다시 그리기
+            self._last = [None] * self.LINES  # 새 팔레트로 텍스트 다시 그리기
             log.info("bar camo #%02x%02x%02x", r, gr, b)
         except Exception:
             log.exception("bg capture failed")
@@ -893,13 +895,15 @@ class FloatingBar(threading.Thread):
     def _place_initial(self):
         w, h = self._fix_w, self._fix_h
         x, y = self.app.cfg.get("bar_x"), self.app.cfg.get("bar_y")
-        if x is None or y is None:
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            r = ctypes.wintypes.RECT()
-            ctypes.windll.user32.SystemParametersInfoW(0x0030, 0,
-                                                       ctypes.byref(r), 0)
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        r = ctypes.wintypes.RECT()
+        ctypes.windll.user32.SystemParametersInfoW(0x0030, 0,
+                                                   ctypes.byref(r), 0)
+        if x is None:
             x = sw - w - 330                       # 트레이 아이콘 왼쪽
+        # 줄이 늘어 바가 높아지면 저장된 y로는 화면 아래로 넘친다 — 다시 맞춘다
+        if y is None or int(y) + h > sh:
             if sh > r.bottom:                      # 작업표시줄이 아래쪽
                 y = r.bottom + max((sh - r.bottom - h) // 2, 0)
             else:
@@ -931,18 +935,18 @@ class FloatingBar(threading.Thread):
         self.root.withdraw()
 
     def _pick(self):
-        """rows에서 (세션, 둘째 줄, 둘째줄라벨) 고르기 — Fable 우선, 없으면 주간."""
-        sess = fable = week = None
+        """rows에서 [(줄이름, 값)] 세 줄 — 세션 / 주간(모든 모델) / 모델별."""
+        sess = week = model = None
+        mname = "모델"
         for label, pct, reset in self.app.rows:
             if label == "현재 세션" and sess is None:
                 sess = (pct, reset)
-            elif "Fable" in label and fable is None:
-                fable = (pct, reset)
-            elif label.startswith("주간") and week is None:
+            elif label.startswith("주간 (") and week is None:
                 week = (pct, reset)
-        if fable:
-            return sess, fable, "Fable"
-        return sess, week, "주간"
+            elif label.startswith("주간 ") and model is None:
+                model = (pct, reset)
+                mname = label[3:]           # "주간 Fable" → "Fable"
+        return [("세션", sess), ("주간", week), (mname, model)]
 
     def _tick(self):
         if self.app.stop_evt.is_set():
@@ -966,11 +970,11 @@ class FloatingBar(threading.Thread):
             return
         if self._ticks % 15 == 0:
             self._match_background()
-        sess, second, name2 = self._pick()
+        lines = self._pick()
         notice = self.app.auth_notice
-        for idx, (title, row) in enumerate((("세션", sess), (name2, second))):
-            if idx == 1 and notice:     # 둘째 줄을 재발급 안내로 대체
-                self._set_line(1, "", notice, "", "#da3633")
+        for idx, (title, row) in enumerate(lines):
+            if idx == len(lines) - 1 and notice:    # 마지막 줄을 재발급 안내로
+                self._set_line(idx, "", notice, "", "#da3633")
             elif row:
                 pct, reset = row
                 t = short_reset(reset)
