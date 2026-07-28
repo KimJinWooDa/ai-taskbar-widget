@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.17.0"
+__version__ = "2.17.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -849,7 +849,8 @@ class FloatingBar(threading.Thread):
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
     PAD = 8                 # 좌우 여백 — 모든 줄의 라벨이 여기서 시작한다
     TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
-    FAST_MS = 100           # 훅이 놓쳤을 때를 위한 보험 확인 (평소엔 훅이 먼저)
+    RESTORE_MS = 30         # 숨어 있는 동안에만 도는 복귀 확인 (평소엔 안 돈다)
+    HIDE_MS = 100           # 훅이 놓쳤을 때를 위한 보험 (평소엔 훅이 먼저 잡는다)
     CAMO_EVERY = 20         # 10초마다 배경 확인
     ADOPT_EVERY = 120       # 60초마다 소유 관계 재확인
     CAMO_MAX_AGE = 300      # 옆 픽셀이 그대로여도 이 시간이 지나면 한 번 다시 찍는다
@@ -895,6 +896,9 @@ class FloatingBar(threading.Thread):
         self._mapped = False        # Tk deiconify는 처음 한 번만 (이후 Win32로)
         self._hwnd = 0              # 콜백이 쓸 창 핸들 캐시 — 틱이 갱신한다
         self._clear = 0             # 가림이 풀린 연속 틱 수 (되보이기 디바운스)
+        self._fs_hidden = False     # 전체화면 때문에 숨은 상태인가
+        self._restore = False       # 훅이 먼저 띄웠으니 틱이 마무리하라는 표시
+        self._watching = False      # 복귀 감시 루프가 도는 중인가
         self._camo_at = 0.0
         self._pal = self.PAL_DARK
         self._bgimg = None
@@ -923,9 +927,9 @@ class FloatingBar(threading.Thread):
         self._adopt_by_taskbar()
         root.update_idletasks()  # 이걸 해야 최상위 창이 생긴다(그전엔 GetParent=0)
         self._apply_lock()       # 첫 deiconify 전에 걸어야 그때부터 안 뺏는다
-        self._hook_events()      # 전체화면 진입을 즉시 받는다 (폴링은 보험)
+        self._hook_events()      # 전체화면 전환은 훅이 즉시 받는다
         self._tick()
-        self._fast()
+        self._watch_hide()       # 훅이 놓친 경우의 보험
         root.mainloop()
 
     def _adopt_by_taskbar(self):
@@ -1187,40 +1191,82 @@ class FloatingBar(threading.Thread):
         except Exception:
             log.exception("hook install failed")
 
-    def _on_win_event(self, hook, event, hwnd, idobj, idchild, thread, ms):
-        """창이 전면이 되거나 크기가 바뀐 순간 — 전체화면이면 그 자리에서 숨는다.
+    def _watch_hide(self):
+        """훅이 놓친 전환을 위한 보험 — 숨기는 쪽만 본다.
 
-        이 콜백은 Tk의 메시지 펌프 한가운데서 불린다. 여기서 Tk/Tcl을 건드리면
-        재진입이라 프로세스가 그대로 죽는다(실측: `winfo_id()`를 부르는 경로를
-        넣었더니 pythonw가 0xc0000409로 크래시). 그래서 Win32만 쓰고, 창 핸들도
-        미리 받아 둔 것을 쓴다 — 갱신은 틱이 한다.
-        """
-        if idobj != OBJID_WINDOW or not self._shown or not self._hwnd:
-            return
-        try:
-            u = ctypes.windll.user32
-            u.GetForegroundWindow.restype = ctypes.c_void_p
-            if hwnd and hwnd != u.GetForegroundWindow():
-                return              # 뒤쪽 창이 움직인 것 — 대부분 여기서 끝난다
-            if _fullscreen_now():
-                u.ShowWindow(ctypes.c_void_p(self._hwnd), 0)    # SW_HIDE
-                self._shown = False
-        except Exception:
-            pass                    # 콜백에서 로그를 쏟지 않는다
-
-    def _fast(self):
-        """훅이 못 받은 경우를 위한 보험 — 숨기는 쪽만, 조용히.
-
-        다시 보이는 것은 틱이 한다. 두 군데서 보이기를 다투면 깜빡인다.
+        훅은 창 이벤트가 있어야 오는데, 앱이 이벤트를 한 번만 보내고 그때 아직
+        크기가 안 잡혀 있으면 놓친다(실측: 그럴 때 틱까지 0.4초를 기다렸다).
+        값싼 검사 7번이라 이 주기가 CPU에 잡히지 않는다.
         """
         if self.app.stop_evt.is_set():
             return
         try:
             if self._shown and _fullscreen_now():
                 self._show(False)
+                self._fs_hidden = True
+                if not self._watching:
+                    self._watching = True
+                    self.root.after(self.RESTORE_MS, self._watch_restore)
         except Exception:
-            log.exception("fast hide failed")
-        self.root.after(self.FAST_MS, self._fast)
+            log.exception("hide watch failed")
+        self.root.after(self.HIDE_MS, self._watch_hide)
+
+    def _watch_restore(self):
+        """전체화면 때문에 숨어 있는 동안에만 도는 짧은 확인 — 끝나면 바로 돌아온다.
+
+        평상시에는 아무것도 돌지 않는다(숨긴 뒤에만 살아나고, 돌아오면 죽는다).
+        훅은 창 이벤트가 있어야 오는데, 전체화면이 끝나는 순간 작업표시줄이
+        제자리를 찾기까지 10ms쯤 걸려서 그 사이 온 이벤트로는 판정이 안 된다 —
+        그 틈을 이 루프가 메운다. Tk 스레드라 여기서는 배경까지 제대로 입힌다.
+        """
+        if self.app.stop_evt.is_set() or self._shown or not self._fs_hidden:
+            self._watching = False
+            return
+        try:
+            if not _fullscreen_now() and self.app.cfg.get("bar_visible", True):
+                self._fs_hidden = False
+                self._restore = False
+                self._watching = False
+                self._covered = 0
+                self._show(True)
+                return
+        except Exception:
+            log.exception("restore watch failed")
+        self.root.after(self.RESTORE_MS, self._watch_restore)
+
+    def _on_win_event(self, hook, event, hwnd, idobj, idchild, thread, ms):
+        """창이 전면이 되거나 크기가 바뀐 순간 — 전체화면이면 숨고, 끝나면 돌아온다.
+
+        이 콜백은 Tk의 메시지 펌프 한가운데서 불린다. 여기서 Tk/Tcl을 건드리면
+        재진입이라 프로세스가 그대로 죽는다(실측: `winfo_id()`를 부르는 경로를
+        넣었더니 pythonw가 0xc0000409로 크래시). 그래서 Win32만 쓰고, 창 핸들도
+        미리 받아 둔 것을 쓴다 — 갱신은 틱이 한다.
+
+        돌아올 때 배경·소유관계까지 여기서 손대면 Tk가 필요하므로, 창만 먼저
+        띄우고 나머지는 `_restore` 표시를 남겨 다음 틱에 맡긴다.
+        """
+        if idobj != OBJID_WINDOW or not self._hwnd:
+            return
+        try:
+            u = ctypes.windll.user32
+            u.GetForegroundWindow.restype = ctypes.c_void_p
+            if hwnd and hwnd != u.GetForegroundWindow():
+                return              # 뒤쪽 창이 움직인 것 — 대부분 여기서 끝난다
+            full = _fullscreen_now()
+            if self._shown and full:
+                u.ShowWindow(ctypes.c_void_p(self._hwnd), 0)    # SW_HIDE
+                self._shown = False
+                self._fs_hidden = True
+            elif (not self._shown and self._fs_hidden and not full
+                  and self.app.cfg.get("bar_visible", True)):
+                u.ShowWindow(ctypes.c_void_p(self._hwnd), 4)    # SHOWNOACTIVATE
+                u.SetWindowPos(ctypes.c_void_p(self._hwnd), ctypes.c_void_p(0),
+                               0, 0, 0, 0, 0x0013)              # HWND_TOP
+                self._shown = True
+                self._fs_hidden = False
+                self._restore = True
+        except Exception:
+            pass                    # 콜백에서 로그를 쏟지 않는다
 
     def _update(self):
         self._ticks += 1
@@ -1242,9 +1288,18 @@ class FloatingBar(threading.Thread):
         self._clear = 0 if hide else self._clear + 1
         if fullscreen or self._covered >= 2:    # 픽셀 판정만 2회 연속을 요구한다
             self._show(False)
+            self._fs_hidden = bool(fullscreen)  # 되살릴 수 있는 건 이 경우뿐
+            if self._fs_hidden and not self._watching:
+                self._watching = True           # 숨어 있는 동안만 짧게 지켜본다
+                self.root.after(self.RESTORE_MS, self._watch_restore)
             return
-        if not self._shown and self._clear < 2:
+        if not self._shown and self._clear < 2 and not self._fs_hidden:
             return          # 가림이 풀린 직후 한 틱은 더 본다 — 되보이기 깜빡임 방지
+        if self._restore:   # 훅이 먼저 띄워 놨다 — 배경·z는 여기서 마무리한다
+            self._restore = False
+            self._match_background(force=True)
+            self._adopt_by_taskbar()
+            self._sync_topmost(raise_now=True)
         if self._recapture and not snip:
             self._recapture = False
             self._match_background(force=True)
@@ -1308,15 +1363,15 @@ class FloatingBar(threading.Thread):
     def _show(self, on):
         """상태가 바뀔 때만 표시/숨김 — 매 틱 재표시로 인한 깜빡임 방지."""
         if on and not self._shown:
-            # 숨어 있는 동안 아래가 바뀌었을 수 있다(전체화면 종료·테마 변경).
-            # 창이 아직 안 보이는 지금 찍으면 깜빡임 없이 새 배경을 입는다.
-            self._match_background(force=True)
             if not self._mapped:
                 self.root.deiconify()   # Tk 상태를 normal로 만드는 건 한 번만
                 self._mapped = True
-            self._win_show(True)
+            self._win_show(True)        # 먼저 띄운다 — 배경 촬영이 복귀를 늦추면 안 된다
             self._adopt_by_taskbar()    # 표시 후에 걸어야 Tk가 안 지운다
             self._sync_topmost(raise_now=True)
+            # 숨어 있는 동안 아래가 바뀌었을 수 있으니(테마·아이콘) 곧바로 맞춘다.
+            # 바 양옆을 뜨는 방식이라 바가 보이는 채로 찍어도 된다(v2.16).
+            self._match_background(force=True)
         elif not on and self._shown:
             self._win_show(False)
         elif on and self._ticks % self.ADOPT_EVERY == 0:
