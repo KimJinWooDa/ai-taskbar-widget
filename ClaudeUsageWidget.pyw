@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.16.3"
+__version__ = "2.17.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -815,11 +815,25 @@ def _fullscreen_now():
 
     두 신호를 같이 본다 — ①Windows가 작업표시줄 topmost를 뗐다(정확하지만 몇 초
     늦기도 한다) ②전면 창이 화면을 다 덮는다(즉시 알 수 있다). 둘 중 하나면
-    전체화면으로 보고 바를 숨긴다.
+    전체화면으로 보고 바를 숨긴다. 창 이벤트마다 불리므로 값싼 검사를 먼저 하고,
+    프로세스 이름을 읽는 캡처 검사는 정말 숨기기 직전에만 한다.
     """
-    if _snip_foreground():
+    if _tray_topmost() and not _fullscreen_foreground():
         return False
-    return not _tray_topmost() or _fullscreen_foreground()
+    return not _snip_foreground()
+
+
+# 전체화면 창이 뜨는 '그 순간'을 받기 위한 훅 —
+# 폴링(0.1초)으로는 한두 프레임이 비친다. 전면 전환과 창 크기변경 둘 다 본다
+# (크롬이 전체화면이 될 땐 전면은 그대로고 창 크기만 바뀐다).
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+WINEVENT_SKIPOWNPROCESS = 0x0002
+OBJID_WINDOW = 0
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.c_void_p,
+    ctypes.wintypes.LONG, ctypes.wintypes.LONG,
+    ctypes.wintypes.DWORD, ctypes.wintypes.DWORD)
 
 
 class FloatingBar(threading.Thread):
@@ -835,7 +849,7 @@ class FloatingBar(threading.Thread):
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
     PAD = 8                 # 좌우 여백 — 모든 줄의 라벨이 여기서 시작한다
     TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
-    FAST_MS = 100           # 숨기기 전용 짧은 확인 — 창 스타일만 읽어 거의 공짜
+    FAST_MS = 100           # 훅이 놓쳤을 때를 위한 보험 확인 (평소엔 훅이 먼저)
     CAMO_EVERY = 20         # 10초마다 배경 확인
     ADOPT_EVERY = 120       # 60초마다 소유 관계 재확인
     CAMO_MAX_AGE = 300      # 옆 픽셀이 그대로여도 이 시간이 지나면 한 번 다시 찍는다
@@ -878,6 +892,9 @@ class FloatingBar(threading.Thread):
         self._pending = None
         self._snip_active = False
         self._recapture = False
+        self._mapped = False        # Tk deiconify는 처음 한 번만 (이후 Win32로)
+        self._hwnd = 0              # 콜백이 쓸 창 핸들 캐시 — 틱이 갱신한다
+        self._clear = 0             # 가림이 풀린 연속 틱 수 (되보이기 디바운스)
         self._camo_at = 0.0
         self._pal = self.PAL_DARK
         self._bgimg = None
@@ -906,6 +923,7 @@ class FloatingBar(threading.Thread):
         self._adopt_by_taskbar()
         root.update_idletasks()  # 이걸 해야 최상위 창이 생긴다(그전엔 GetParent=0)
         self._apply_lock()       # 첫 deiconify 전에 걸어야 그때부터 안 뺏는다
+        self._hook_events()      # 전체화면 진입을 즉시 받는다 (폴링은 보험)
         self._tick()
         self._fast()
         root.mainloop()
@@ -1122,7 +1140,7 @@ class FloatingBar(threading.Thread):
     def _hide_click(self, e):
         self.app.cfg["bar_visible"] = False
         save_config(self.app.cfg)
-        self.root.withdraw()
+        self._show(False)
 
     def _pick(self):
         """rows에서 [(줄이름, 값)] 세 줄 — 세션 / 주간(모든 모델) / 모델별."""
@@ -1148,11 +1166,52 @@ class FloatingBar(threading.Thread):
             log.exception("bar update failed")
         self.root.after(self.TICK_MS, self._tick)
 
-    def _fast(self):
-        """전체화면 진입을 100ms 안에 알아채고 숨는다 — 0.5초 틱은 눈에 띈다.
+    def _hook_events(self):
+        """전체화면 창이 뜨는 즉시 콜백을 받도록 WinEvent 훅을 건다.
 
-        숨기는 쪽만 맡는다. 다시 보이는 것은 틱이 한다 — 두 군데서 보이기를
-        다투면 깜빡이고, 늦게 나타나는 건 눈에 안 띈다.
+        훅은 이 스레드(Tk 메인루프)에 걸어야 콜백도 이 스레드로 온다 —
+        그래야 콜백 안에서 바를 숨겨도 스레드 문제가 없다. 콜백에서 Tk 함수는
+        부르지 않는다(`_win_show`가 Win32만 쓴다).
+        """
+        try:
+            u = ctypes.windll.user32
+            u.SetWinEventHook.restype = ctypes.c_void_p
+            self._winproc = WINEVENTPROC(self._on_win_event)   # 참조 유지 필수
+            self._hooks = [
+                u.SetWinEventHook(ev, ev, None, self._winproc, 0, 0,
+                                  WINEVENT_SKIPOWNPROCESS)
+                for ev in (EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_LOCATIONCHANGE)
+            ]
+            log.info("win event hooks: %s",
+                     [bool(h) for h in self._hooks])
+        except Exception:
+            log.exception("hook install failed")
+
+    def _on_win_event(self, hook, event, hwnd, idobj, idchild, thread, ms):
+        """창이 전면이 되거나 크기가 바뀐 순간 — 전체화면이면 그 자리에서 숨는다.
+
+        이 콜백은 Tk의 메시지 펌프 한가운데서 불린다. 여기서 Tk/Tcl을 건드리면
+        재진입이라 프로세스가 그대로 죽는다(실측: `winfo_id()`를 부르는 경로를
+        넣었더니 pythonw가 0xc0000409로 크래시). 그래서 Win32만 쓰고, 창 핸들도
+        미리 받아 둔 것을 쓴다 — 갱신은 틱이 한다.
+        """
+        if idobj != OBJID_WINDOW or not self._shown or not self._hwnd:
+            return
+        try:
+            u = ctypes.windll.user32
+            u.GetForegroundWindow.restype = ctypes.c_void_p
+            if hwnd and hwnd != u.GetForegroundWindow():
+                return              # 뒤쪽 창이 움직인 것 — 대부분 여기서 끝난다
+            if _fullscreen_now():
+                u.ShowWindow(ctypes.c_void_p(self._hwnd), 0)    # SW_HIDE
+                self._shown = False
+        except Exception:
+            pass                    # 콜백에서 로그를 쏟지 않는다
+
+    def _fast(self):
+        """훅이 못 받은 경우를 위한 보험 — 숨기는 쪽만, 조용히.
+
+        다시 보이는 것은 틱이 한다. 두 군데서 보이기를 다투면 깜빡인다.
         """
         if self.app.stop_evt.is_set():
             return
@@ -1165,6 +1224,9 @@ class FloatingBar(threading.Thread):
 
     def _update(self):
         self._ticks += 1
+        # 콜백에서 쓸 창 핸들은 여기(Tk 스레드)서만 구한다
+        u0 = ctypes.windll.user32
+        self._hwnd = u0.GetParent(self.root.winfo_id()) or self.root.winfo_id()
         if not self.app.cfg.get("bar_visible", True):
             self._show(False)
             return
@@ -1175,10 +1237,14 @@ class FloatingBar(threading.Thread):
         self._sync_topmost()
         # 픽셀 검사만으로는 작업표시줄이 아직 영상 위에 그려진 순간을 못 잡는다
         fullscreen = not snip and _fullscreen_now()
-        self._covered = self._covered + 1 if (covered or fullscreen) else 0
+        hide = covered or fullscreen
+        self._covered = self._covered + 1 if hide else 0
+        self._clear = 0 if hide else self._clear + 1
         if fullscreen or self._covered >= 2:    # 픽셀 판정만 2회 연속을 요구한다
             self._show(False)
             return
+        if not self._shown and self._clear < 2:
+            return          # 가림이 풀린 직후 한 틱은 더 본다 — 되보이기 깜빡임 방지
         if self._recapture and not snip:
             self._recapture = False
             self._match_background(force=True)
@@ -1227,17 +1293,32 @@ class FloatingBar(threading.Thread):
         self.cv.coords(v, cols[0], y)      # 값은 오른쪽 정렬 — 끝이 맞는다
         self.cv.coords(w, cols[1], y)
 
+    def _win_show(self, on):
+        """표시·숨김은 Win32로 직접 한다 — Tk의 deiconify/withdraw를 안 쓴다.
+
+        withdraw로 숨긴 뒤의 deiconify는 Tk가 상태를 'normal'로 알고 있으면
+        무시될 수 있다. SW_SHOWNOACTIVATE는 활성화도 하지 않아 전체화면 앱에서
+        포커스를 뺏지 않는다. 핸들은 틱에서 캐시해 둔 것을 쓴다(콜백 경로가
+        Tk를 못 부르기 때문 — `_on_win_event` 참고).
+        """
+        u = ctypes.windll.user32
+        if self._hwnd:
+            u.ShowWindow(ctypes.c_void_p(self._hwnd), 4 if on else 0)
+
     def _show(self, on):
         """상태가 바뀔 때만 표시/숨김 — 매 틱 재표시로 인한 깜빡임 방지."""
         if on and not self._shown:
             # 숨어 있는 동안 아래가 바뀌었을 수 있다(전체화면 종료·테마 변경).
             # 창이 아직 안 보이는 지금 찍으면 깜빡임 없이 새 배경을 입는다.
             self._match_background(force=True)
-            self.root.deiconify()
+            if not self._mapped:
+                self.root.deiconify()   # Tk 상태를 normal로 만드는 건 한 번만
+                self._mapped = True
+            self._win_show(True)
             self._adopt_by_taskbar()    # 표시 후에 걸어야 Tk가 안 지운다
             self._sync_topmost(raise_now=True)
         elif not on and self._shown:
-            self.root.withdraw()
+            self._win_show(False)
         elif on and self._ticks % self.ADOPT_EVERY == 0:
             self._adopt_by_taskbar()    # 연결이 풀린 경우를 위한 드문 보험
             self._sync_topmost(raise_now=True)
