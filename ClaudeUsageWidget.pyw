@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.16.0"
+__version__ = "2.16.3"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -745,6 +745,83 @@ def _taskbar_covered():
         return False, False
 
 
+def _tray_topmost():
+    """작업표시줄이 topmost인가 — 아니면 전체화면 앱이 떠 있다는 뜻.
+
+    Windows가 직접 내리는 비트라 가장 정확하다. 다만 전체화면이 된 뒤 몇 초
+    늦게 내려갈 때가 있어 `_fullscreen_now()`에서 다른 신호와 함께 쓴다.
+    못 읽으면 평상시로 본다.
+    """
+    try:
+        u = ctypes.windll.user32
+        u.FindWindowW.restype = ctypes.c_void_p
+        tray = u.FindWindowW("Shell_TrayWnd", None)
+        return not tray or bool(
+            u.GetWindowLongW(ctypes.c_void_p(tray), -20) & 0x8)
+    except Exception:
+        return True
+
+
+def _foreground_pair():
+    """전면 창과 그 최상위 조상 — UWP는 최상위가 ApplicationFrameHost다."""
+    u = ctypes.windll.user32
+    u.GetForegroundWindow.restype = ctypes.c_void_p
+    u.GetAncestor.restype = ctypes.c_void_p
+    fg = u.GetForegroundWindow()
+    if not fg:
+        return None, None
+    return fg, u.GetAncestor(ctypes.c_void_p(fg), 2)
+
+
+def _snip_foreground():
+    """전면에 화면 캡처 도구의 오버레이가 떠 있는가.
+
+    캡처 중에는 바를 숨기면 안 된다 — 찍힌 사진에서 바만 빠진다.
+    """
+    try:
+        fg, top = _foreground_pair()
+        if not fg:
+            return False
+        return bool(({_window_exe(fg), _window_exe(top)} - {""}) & SNIP_EXES)
+    except Exception:
+        return False
+
+
+def _fullscreen_foreground():
+    """전면 창이 화면을 통째로 덮는가 — 바탕화면 같은 셸 창은 제외.
+
+    테두리 없는 최대화 창은 작업표시줄 높이만큼 모자라 여기 안 걸린다.
+    """
+    try:
+        u = ctypes.windll.user32
+        fg, _ = _foreground_pair()
+        if not fg:
+            return False
+        cn = ctypes.create_unicode_buffer(64)
+        u.GetClassNameW(ctypes.c_void_p(fg), cn, 64)
+        if cn.value in ("Progman", "WorkerW", "Shell_TrayWnd",
+                        "Shell_SecondaryTrayWnd"):
+            return False
+        r = ctypes.wintypes.RECT()
+        u.GetWindowRect(ctypes.c_void_p(fg), ctypes.byref(r))
+        return (r.right - r.left >= u.GetSystemMetrics(0)
+                and r.bottom - r.top >= u.GetSystemMetrics(1))
+    except Exception:
+        return False
+
+
+def _fullscreen_now():
+    """지금 전체화면 앱이 떠 있는가 (캡처 오버레이는 아니다).
+
+    두 신호를 같이 본다 — ①Windows가 작업표시줄 topmost를 뗐다(정확하지만 몇 초
+    늦기도 한다) ②전면 창이 화면을 다 덮는다(즉시 알 수 있다). 둘 중 하나면
+    전체화면으로 보고 바를 숨긴다.
+    """
+    if _snip_foreground():
+        return False
+    return not _tray_topmost() or _fullscreen_foreground()
+
+
 class FloatingBar(threading.Thread):
     """작업표시줄에 얹히는 투명 세 줄 바 (시안 B) — 세션 / 주간 / 모델별(Fable).
 
@@ -758,6 +835,7 @@ class FloatingBar(threading.Thread):
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
     PAD = 8                 # 좌우 여백 — 모든 줄의 라벨이 여기서 시작한다
     TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
+    FAST_MS = 100           # 숨기기 전용 짧은 확인 — 창 스타일만 읽어 거의 공짜
     CAMO_EVERY = 20         # 10초마다 배경 확인
     ADOPT_EVERY = 120       # 60초마다 소유 관계 재확인
     CAMO_MAX_AGE = 300      # 옆 픽셀이 그대로여도 이 시간이 지나면 한 번 다시 찍는다
@@ -819,7 +897,6 @@ class FloatingBar(threading.Thread):
                        cv.create_text(self.PAD, y, anchor="w", font=f, text="",
                                       fill=self._pal["time"]))
                       for y in self._ys]
-        self._lock_applied = None
         for w in (root, cv):
             w.bind("<Button-1>", self._press)
             w.bind("<B1-Motion>", self._drag)
@@ -827,7 +904,10 @@ class FloatingBar(threading.Thread):
             w.bind("<Button-3>", self._hide_click)
         self._place_initial()
         self._adopt_by_taskbar()
+        root.update_idletasks()  # 이걸 해야 최상위 창이 생긴다(그전엔 GetParent=0)
+        self._apply_lock()       # 첫 deiconify 전에 걸어야 그때부터 안 뺏는다
         self._tick()
+        self._fast()
         root.mainloop()
 
     def _adopt_by_taskbar(self):
@@ -857,39 +937,29 @@ class FloatingBar(threading.Thread):
             log.exception("adopt failed")
 
     def _sync_topmost(self, raise_now=False):
-        """바의 topmost를 작업표시줄과 같게 맞추고, 평상시에만 위로 올린다.
+        """작업표시줄이 topmost일 때만 바를 그 바로 위로 올린다.
 
-        전체화면 앱(영상·게임)이 뜨면 Windows가 작업표시줄의 topmost를 떼어
-        그 아래로 내린다. 바만 topmost로 남으면 화면 위에 혼자 떠 있으므로
-        같은 순간 따라 내려오고, 전체화면이 끝나면 함께 올라온다.
-        올리기는 작업표시줄이 topmost일 때만 — 전체화면 중에 올리면
-        영상 위로 다시 튀어나온다.
+        전체화면 앱이 뜨면 Windows가 작업표시줄의 topmost를 뗀다. 그렇다고 바를
+        `HWND_NOTOPMOST`로 함께 내리면 안 된다 — 그 호출은 '내린다'가 아니라
+        '일반 창 중 맨 위로 올린다'라서, 소유자인 작업표시줄까지 영상 바로 위로
+        끌어올려 **작업표시줄이 전체화면 위에 남는다**(실측: 위젯을 끄면 작업표시줄
+        z가 20위로 가라앉고, 켜면 영상 바로 위 3위에 고정됐다).
+        그래서 전체화면 동안에는 z를 아예 건드리지 않고 바를 숨기기만 한다
+        (`_update`가 작업표시줄 topmost를 보고 숨긴다).
         """
         try:
             u = ctypes.windll.user32
             u.FindWindowW.restype = ctypes.c_void_p
-            u.GetWindow.restype = ctypes.c_void_p
-            tray = u.FindWindowW("Shell_TrayWnd", None)
-            if not tray:
-                return
-            want = bool(u.GetWindowLongW(ctypes.c_void_p(tray), -20) & 0x8)
+            if not _tray_topmost():
+                return              # 전체화면 — z는 그대로 두고 숨는 쪽에 맡긴다
             hwnd = u.GetParent(self.root.winfo_id()) or self.root.winfo_id()
             # 실제 상태를 매번 읽으므로 어긋나 있으면 스스로 복구된다
-            if bool(u.GetWindowLongW(hwnd, -20) & 0x8) != want:
-                u.SetWindowPos(ctypes.c_void_p(hwnd),
-                               ctypes.c_void_p(-1 if want else -2),
+            if not bool(u.GetWindowLongW(hwnd, -20) & 0x8):
+                u.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(-1),
                                0, 0, 0, 0, 0x0013)  # NOSIZE|NOMOVE|NOACTIVATE
-                raise_now = want    # 되돌아올 땐 위치까지 다시 잡는다
-                log.info("bar topmost -> %s", want)
-                if not want:
-                    # HWND_NOTOPMOST는 '모든 일반 창 위'로 올려버린다 —
-                    # 전체화면 앱 위로 튀어나오지 않게 작업표시줄 바로 위로 끼운다
-                    prev = u.GetWindow(ctypes.c_void_p(tray), 3)  # GW_HWNDPREV
-                    if prev and prev != hwnd:
-                        u.SetWindowPos(ctypes.c_void_p(hwnd),
-                                       ctypes.c_void_p(prev),
-                                       0, 0, 0, 0, 0x0013)
-            if raise_now and want:
+                raise_now = True
+                log.info("bar topmost -> True")
+            if raise_now:
                 u.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(0),
                                0, 0, 0, 0, 0x0013)  # HWND_TOP — 작업표시줄 위로
         except Exception:
@@ -990,20 +1060,25 @@ class FloatingBar(threading.Thread):
         return self._pal["value"]
 
     def _apply_lock(self):
-        """잠금이면 클릭 통과(WS_EX_TRANSPARENT), 아니면 해제. Alt-Tab 제외는 항상."""
+        """잠금이면 클릭 통과(WS_EX_TRANSPARENT), 아니면 해제.
+
+        Alt-Tab 제외(TOOLWINDOW)와 활성화 금지(NOACTIVATE)는 항상 건다.
+        NOACTIVATE가 없으면 숨었다 다시 나올 때 바가 포그라운드를 빼앗는다
+        (deiconify는 SW_RESTORE라 '표시'가 아니라 '활성화하고 표시'다) —
+        그러면 전체화면 영상이 전면에서 밀려나 Windows가 전체화면 모드를
+        끝내고 작업표시줄을 영상 위로 다시 올린다.
+        """
         locked = bool(self.app.cfg.get("bar_locked"))
-        if locked == self._lock_applied:
-            return
         try:
             u = ctypes.windll.user32
             hwnd = u.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-            style = u.GetWindowLongW(hwnd, -20) | 0x80
-            if locked:
-                style |= 0x20
-            else:
-                style &= ~0x20
-            u.SetWindowLongW(hwnd, -20, style)
-            self._lock_applied = locked
+            # 실제 스타일을 매번 읽는다 — 창이 만들어지기 전에는 GetParent가 0이라
+            # 엉뚱한 창에 걸릴 수 있는데, 그래도 다음 틱에 제자리를 찾는다
+            style = u.GetWindowLongW(hwnd, -20)
+            want = style | 0x80 | 0x08000000
+            want = (want | 0x20) if locked else (want & ~0x20)
+            if want != style:
+                u.SetWindowLongW(hwnd, -20, want)
         except Exception:
             log.exception("lock apply failed")
 
@@ -1073,6 +1148,21 @@ class FloatingBar(threading.Thread):
             log.exception("bar update failed")
         self.root.after(self.TICK_MS, self._tick)
 
+    def _fast(self):
+        """전체화면 진입을 100ms 안에 알아채고 숨는다 — 0.5초 틱은 눈에 띈다.
+
+        숨기는 쪽만 맡는다. 다시 보이는 것은 틱이 한다 — 두 군데서 보이기를
+        다투면 깜빡이고, 늦게 나타나는 건 눈에 안 띈다.
+        """
+        if self.app.stop_evt.is_set():
+            return
+        try:
+            if self._shown and _fullscreen_now():
+                self._show(False)
+        except Exception:
+            log.exception("fast hide failed")
+        self.root.after(self.FAST_MS, self._fast)
+
     def _update(self):
         self._ticks += 1
         if not self.app.cfg.get("bar_visible", True):
@@ -1082,9 +1172,11 @@ class FloatingBar(threading.Thread):
         if self._snip_active and not snip:
             self._recapture = True  # 캡처가 끝났으면 그동안의 변화를 다시 입는다
         self._snip_active = snip
-        self._sync_topmost()        # 전체화면이면 이 순간 바도 아래로 내려간다
-        self._covered = self._covered + 1 if covered else 0
-        if self._covered >= 2:      # 순간 오탐으로 깜빡이지 않게 2회 연속일 때만
+        self._sync_topmost()
+        # 픽셀 검사만으로는 작업표시줄이 아직 영상 위에 그려진 순간을 못 잡는다
+        fullscreen = not snip and _fullscreen_now()
+        self._covered = self._covered + 1 if (covered or fullscreen) else 0
+        if fullscreen or self._covered >= 2:    # 픽셀 판정만 2회 연속을 요구한다
             self._show(False)
             return
         if self._recapture and not snip:
