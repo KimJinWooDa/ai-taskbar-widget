@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.17.1"
+__version__ = "2.17.2"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -773,18 +773,45 @@ def _foreground_pair():
     return fg, u.GetAncestor(ctypes.c_void_p(fg), 2)
 
 
-def _snip_foreground():
-    """전면에 화면 캡처 도구의 오버레이가 떠 있는가.
-
-    캡처 중에는 바를 숨기면 안 된다 — 찍힌 사진에서 바만 빠진다.
-    """
+def _covers_screen(hwnd):
+    """그 창이 화면 전체를 덮는가."""
     try:
-        fg, top = _foreground_pair()
-        if not fg:
-            return False
-        return bool(({_window_exe(fg), _window_exe(top)} - {""}) & SNIP_EXES)
+        u = ctypes.windll.user32
+        r = ctypes.wintypes.RECT()
+        u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r))
+        return (r.right - r.left >= u.GetSystemMetrics(0)
+                and r.bottom - r.top >= u.GetSystemMetrics(1))
     except Exception:
         return False
+
+
+def _snip_overlay():
+    """화면 캡처 도구의 오버레이가 떠 있는가 — 그동안은 바를 숨기면 안 된다.
+
+    전면 창만 보면 놓친다. 오버레이는 **화면을 덮은 다음에 포그라운드가 되고**,
+    그 사이 100ms 남짓 동안 전면은 아직 이전 앱이라 '전체화면 앱'으로 오해한다.
+    하필 그때 캡처가 찍히면 사진에서 바만 빠진다(사용자 신고, 2026-07-28).
+    그래서 화면 한가운데를 실제로 차지한 창까지 함께 본다.
+    """
+    exes = set()
+    try:
+        u = ctypes.windll.user32
+        fg, top = _foreground_pair()
+        exes |= {_window_exe(fg), _window_exe(top)}
+        u.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+        u.WindowFromPoint.restype = ctypes.c_void_p
+        u.GetAncestor.restype = ctypes.c_void_p
+        pt = ctypes.wintypes.POINT(u.GetSystemMetrics(0) // 2,
+                                   u.GetSystemMetrics(1) // 2)
+        h = u.WindowFromPoint(pt)
+        # 화면을 통째로 덮은 창일 때만 오버레이로 친다 — 핀으로 띄워 둔 캡처
+        # 이미지 창까지 여기 걸리면 영상 전체화면에서 바가 안 숨는다
+        if h and _covers_screen(u.GetAncestor(ctypes.c_void_p(h), 2) or h):
+            exes |= {_window_exe(h),
+                     _window_exe(u.GetAncestor(ctypes.c_void_p(h), 2))}
+    except Exception:
+        return False
+    return bool((exes - {""}) & SNIP_EXES)
 
 
 def _fullscreen_foreground():
@@ -820,7 +847,7 @@ def _fullscreen_now():
     """
     if _tray_topmost() and not _fullscreen_foreground():
         return False
-    return not _snip_foreground()
+    return not _snip_overlay()
 
 
 # 전체화면 창이 뜨는 '그 순간'을 받기 위한 훅 —
@@ -1281,8 +1308,10 @@ class FloatingBar(threading.Thread):
             self._recapture = True  # 캡처가 끝났으면 그동안의 변화를 다시 입는다
         self._snip_active = snip
         self._sync_topmost()
-        # 픽셀 검사만으로는 작업표시줄이 아직 영상 위에 그려진 순간을 못 잡는다
-        fullscreen = not snip and _fullscreen_now()
+        # 판정은 훅·보험과 같은 함수로 한다 — 기준이 다르면 한쪽은 숨기고 한쪽은
+        # 띄워서 0.5초마다 깜빡인다(캡처 중 실측). `_fullscreen_now`가 캡처
+        # 오버레이 예외까지 안에서 처리한다.
+        fullscreen = _fullscreen_now()
         hide = covered or fullscreen
         self._covered = self._covered + 1 if hide else 0
         self._clear = 0 if hide else self._clear + 1
