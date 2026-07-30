@@ -1,53 +1,104 @@
-# Claude 사용량 위젯 설치 스크립트 (Windows PowerShell 5.1+)
-# 1) 파이썬 패키지 설치  2) 훅 스크립트를 ~/.claude 에 복사(경로 치환)
-# 3) settings.json 에 붙여넣을 훅 설정을 출력
+# AI Skill Widget installer for Windows 10/11.
+# Installs the self-contained app, startup entry, and token-free Claude hooks.
 $ErrorActionPreference = "Stop"
 
-# `irm ... | iex` 로 실행되면 스크립트 경로가 없다 — 저장소를 직접 내려받는다.
-$scriptPath = $MyInvocation.MyCommand.Path
-if ($scriptPath) { $repo = Split-Path -Parent $scriptPath } else { $repo = $null }
-if (-not $repo -or -not (Test-Path (Join-Path $repo "ClaudeUsageWidget.pyw"))) {
-    $repo = Join-Path $env:LOCALAPPDATA "claude-taskbar-widget"
-    Write-Host "[0/3] 위젯 다운로드 -> $repo"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $zip = Join-Path $env:TEMP "claude-taskbar-widget.zip"
-    Invoke-WebRequest "https://github.com/KimJinWooDa/claude-taskbar-widget/archive/refs/heads/main.zip" -OutFile $zip -UseBasicParsing
-    $tmp = Join-Path $env:TEMP ("ctw-" + [guid]::NewGuid().ToString("N"))
-    Expand-Archive $zip -DestinationPath $tmp -Force
-    if (Test-Path $repo) { Remove-Item $repo -Recurse -Force }
-    Move-Item (Join-Path $tmp "claude-taskbar-widget-main") $repo
-    Remove-Item $zip -Force
-    Remove-Item $tmp -Recurse -Force
+$repo = Split-Path -Parent $MyInvocation.MyCommand.Path
+$dist = Join-Path $repo "dist"
+$widgetSource = Join-Path $dist "AI-Skill-Widget.exe"
+$hookSource = Join-Path $dist "SkillEventHook.exe"
+
+if (-not (Test-Path $widgetSource) -or -not (Test-Path $hookSource)) {
+    throw "dist 실행 파일이 없습니다. 먼저 .\build.ps1 을 실행하세요."
 }
-$widget = Join-Path $repo "ClaudeUsageWidget.pyw"
+
+$installDir = Join-Path $env:LOCALAPPDATA "AI-Skill-Widget"
+$widget = Join-Path $installDir "AI-Skill-Widget.exe"
+$hook = Join-Path $installDir "SkillEventHook.exe"
+$startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
+$startupVbs = Join-Path $startupDir "AI-Skill-Widget.vbs"
+
+Write-Host "[1/4] 앱 설치 -> $installDir"
+New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+Get-Process -Name "AI-Skill-Widget" -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+Copy-Item $widgetSource $widget -Force
+Copy-Item $hookSource $hook -Force
+
+Write-Host "[2/4] Windows 시작 프로그램 등록"
+New-Item -ItemType Directory -Path $startupDir -Force | Out-Null
+$vbs = 'CreateObject("Wscript.Shell").Run """' + $widget + '""", 0, False'
+[IO.File]::WriteAllText($startupVbs, $vbs, [Text.Encoding]::Unicode)
+
+Write-Host "[3/4] Claude Code 스킬 카운터 훅 병합"
 $claudeDir = Join-Path $env:USERPROFILE ".claude"
+$settingsPath = Join-Path $claudeDir "settings.json"
+New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
 
-if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    Write-Host "python 을 찾을 수 없습니다. Python 3.10+ 를 설치하고 PATH에 추가하세요." -ForegroundColor Red
-    exit 1
+if (Test-Path $settingsPath) {
+    Copy-Item $settingsPath "$settingsPath.skill-widget.bak" -Force
+    try {
+        $settings = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        throw "Claude settings.json이 올바른 JSON이 아닙니다. 수정하지 않았습니다: $settingsPath"
+    }
+}
+else {
+    $settings = [PSCustomObject]@{}
 }
 
-Write-Host "[1/3] 파이썬 패키지 설치 (pystray, Pillow)..."
-python -m pip install -r (Join-Path $repo "requirements.txt") --quiet
+if (-not $settings.PSObject.Properties["hooks"]) {
+    $settings | Add-Member -MemberType NoteProperty -Name "hooks" `
+        -Value ([PSCustomObject]@{})
+}
 
-Write-Host "[2/3] 훅 스크립트 복사 -> $claudeDir"
-if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory $claudeDir | Out-Null }
-$start = Get-Content (Join-Path $repo "hooks\start-usage-widget.py") -Raw -Encoding UTF8
-$start = $start.Replace("__WIDGET_PATH__", $widget)
-[IO.File]::WriteAllText((Join-Path $claudeDir "start-usage-widget.py"), $start, (New-Object Text.UTF8Encoding $false))
-Copy-Item (Join-Path $repo "hooks\usage-hook.py") (Join-Path $claudeDir "usage-hook.py") -Force
+$hookCommand = '"' + ($hook -replace '\\', '/') + '" --client claude'
 
-Write-Host "[3/3] 아래 내용을 $claudeDir\settings.json 의 hooks 에 추가하세요:" -ForegroundColor Yellow
-@"
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "python \"$($claudeDir -replace '\\','/')/start-usage-widget.py\"", "timeout": 15, "async": true } ] }
-    ],
-    "Stop": [
-      { "hooks": [ { "type": "command", "command": "python \"$($claudeDir -replace '\\','/')/usage-hook.py\"", "timeout": 15, "async": true } ] }
-    ]
-  }
-"@ | Write-Host
+function Add-SkillHook {
+    param(
+        [string]$EventName,
+        [string]$Matcher
+    )
+    $groups = @()
+    $prop = $settings.hooks.PSObject.Properties[$EventName]
+    if ($prop) {
+        $groups = @($prop.Value)
+    }
+    $exists = $false
+    foreach ($group in $groups) {
+        foreach ($handler in @($group.hooks)) {
+            if ($handler.command -like "*SkillEventHook*--client claude*") {
+                $exists = $true
+            }
+        }
+    }
+    if (-not $exists) {
+        $handler = [PSCustomObject]@{
+            type = "command"
+            command = $hookCommand
+            timeout = 3
+        }
+        $group = [PSCustomObject]@{
+            matcher = $Matcher
+            hooks = @($handler)
+        }
+        $groups += $group
+    }
+    $settings.hooks | Add-Member -MemberType NoteProperty -Name $EventName `
+        -Value @($groups) -Force
+}
+
+Add-SkillHook -EventName "PreToolUse" -Matcher "^Skill$"
+Add-SkillHook -EventName "UserPromptExpansion" -Matcher ""
+
+$json = $settings | ConvertTo-Json -Depth 30
+[IO.File]::WriteAllText(
+    $settingsPath, $json, (New-Object Text.UTF8Encoding $false)
+)
+
+Write-Host "[4/4] 실행"
+Start-Process -FilePath $widget
 
 Write-Host ""
-Write-Host "완료. 지금 바로 켜려면: $(Join-Path $repo 'run-widget.vbs') 더블클릭" -ForegroundColor Green
+Write-Host "설치 완료. 이후 별도 명령 없이 자동 추적됩니다." -ForegroundColor Green
+Write-Host "Claude 자동 호출/수동 호출은 정확히 집계하고, Codex 자동 호출은 ~추정으로 표시합니다."

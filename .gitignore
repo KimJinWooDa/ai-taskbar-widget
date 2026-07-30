@@ -1,4 +1,11 @@
+.build-deps/
+build/
+dist/
 __pycache__/
 *.pyc
-*.log
-*.tmp
+*.db
+*.db-shm
+*.db-wal
+qa-appdata/
+install-test/
+*-preview*.png

@@ -24,7 +24,9 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.17.2"
+from skill_tracker import TrackerService
+
+__version__ = "3.4.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -495,8 +497,13 @@ def startup_installed():
 
 
 def install_startup():
-    content = ('CreateObject("Wscript.Shell").Run '
-               f'"""{pythonw_exe()}"" ""{os.path.abspath(__file__)}""", 0, False')
+    if getattr(sys, "frozen", False):
+        content = ('CreateObject("Wscript.Shell").Run '
+                   f'"""{sys.executable}""", 0, False')
+    else:
+        content = ('CreateObject("Wscript.Shell").Run '
+                   f'"""{pythonw_exe()}"" ""{os.path.abspath(__file__)}""", '
+                   '0, False')
     with open(STARTUP_VBS, "w", encoding="utf-16") as f:
         f.write(content)
     log.info("startup registered")
@@ -672,6 +679,7 @@ SNIP_EXES = {
     "snipaste.exe", "pixpin.exe",
 }
 _last_cover_exe = None
+_last_snip_at = 0.0     # 캡처 오버레이를 마지막으로 본 시각 — 종료 직후 오탐 방지
 
 
 def _window_exe(hwnd):
@@ -732,6 +740,8 @@ def _taskbar_covered():
         # 직계 창의 프로세스도 함께 본다
         exes = {_window_exe(h), _window_exe(h0)} - {""}
         if exes & SNIP_EXES:
+            global _last_snip_at
+            _last_snip_at = time.time()
             return False, True
         covered = hr.top < r.top - 4
         global _last_cover_exe
@@ -811,7 +821,11 @@ def _snip_overlay():
                      _window_exe(u.GetAncestor(ctypes.c_void_p(h), 2))}
     except Exception:
         return False
-    return bool((exes - {""}) & SNIP_EXES)
+    hit = bool((exes - {""}) & SNIP_EXES)
+    if hit:
+        global _last_snip_at
+        _last_snip_at = time.time()
+    return hit
 
 
 def _fullscreen_foreground():
@@ -847,7 +861,15 @@ def _fullscreen_now():
     """
     if _tray_topmost() and not _fullscreen_foreground():
         return False
-    return not _snip_overlay()
+    if _snip_overlay():
+        return False
+    # 캡처 오버레이가 방금 닫힌 참이면 작업표시줄 topmost 복구가 몇 초 늦는다 —
+    # 오버레이 자체가 전체화면·포그라운드라 Windows가 비트를 떼기 때문. 그 잔상
+    # (비트 내려감)만으로는 숨기지 않고, 화면을 실제로 덮은 전면 창이 보일 때만
+    # 숨긴다. (캡처를 끝낼 때마다 바가 몇 초 사라지던 원인)
+    if time.time() - _last_snip_at < 8 and not _fullscreen_foreground():
+        return False
+    return True
 
 
 # 전체화면 창이 뜨는 '그 순간'을 받기 위한 훅 —
@@ -864,15 +886,20 @@ WINEVENTPROC = ctypes.WINFUNCTYPE(
 
 
 class FloatingBar(threading.Thread):
-    """작업표시줄에 얹히는 투명 세 줄 바 (시안 B) — 세션 / 주간 / 모델별(Fable).
+    """작업표시줄에 얹히는 투명 세 줄 바 — 스킬 패널 + 사용량 패널.
 
-    평상시 무채색, 70%↑ 주황·90%↑ 빨강만 색 표시. 드래그로 이동(위치 저장),
-    우클릭 숨김, 트레이 메뉴에서 표시·잠금 토글. 잠금 시 클릭이 통과한다.
+    왼쪽부터 실행 중인 앱의 스킬 패널(Claude·Codex), 맨 오른쪽(트레이 쪽)에
+    예전 사용량 바 그대로의 세션/주간/모델별 패널을 나란히 표시한다.
+    클릭하면 전체 스킬 목록이 열린다. 드래그로 이동(위치 저장), 우클릭 숨김,
+    잠금 시 클릭이 통과한다.
     z순서는 작업표시줄에 맞춘다 — 소유자로 지정해 바로 위에 두고, topmost
     여부까지 따라가서 전체화면 앱이 뜨면 작업표시줄과 함께 아래로 내려간다.
     """
 
     LINES = 3               # 작업표시줄 48px에 12px 줄 3개 + 여백 6px
+    MAX_PANELS = 3          # Claude 스킬 + Codex 스킬 + 사용량
+    PANEL_GAP = 20
+    ACCENTS = {"claude": "#d97757", "codex": "#45a79a"}
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
     PAD = 8                 # 좌우 여백 — 모든 줄의 라벨이 여기서 시작한다
     TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
@@ -911,7 +938,12 @@ class FloatingBar(threading.Thread):
         # 소유자가 topmost면 non-topmost 소유 창은 그 아래로 가라앉는다.
         root.configure(bg=self.BG)
         f = self._font = tkfont.Font(family="맑은 고딕", size=self.FONT_PX)
-        self._fix_w = f.measure("주간 (모든 모델) 100%  · 16시간 59분 후") + 24
+        # -8px는 한글이 뭉개진다 — 본문(-10)보다 한 단계만 작게
+        self._font_small = tkfont.Font(family="맑은 고딕", size=-9)
+        self._col_gap = max(9, f.measure(" ") * 3)  # 라벨-숫자 사이 간격
+        self._panel_w = f.measure("image-prompt-craft  999회  · 자동 999") + 24
+        self._usage_w = f.measure("Sonnet 100%  · 16시간 59분 후") + 24
+        self._fix_w = self._usage_w
         self._fix_h = self.LINES * f.metrics("linespace") + 6
         self._shown = False
         self._covered = 0
@@ -926,10 +958,17 @@ class FloatingBar(threading.Thread):
         self._fs_hidden = False     # 전체화면 때문에 숨은 상태인가
         self._restore = False       # 훅이 먼저 띄웠으니 틱이 마무리하라는 표시
         self._watching = False      # 복귀 감시 루프가 도는 중인가
+        self._hide_pending_log = False  # 훅이 숨겼다 — 판단 근거는 틱이 남긴다
+        self._sunk_log_at = 0.0     # "가라앉음" 로그 최근 시각 (5초 간격 제한)
         self._camo_at = 0.0
         self._pal = self.PAL_DARK
         self._bgimg = None
-        self._last = [None] * self.LINES
+        self._probe_warned = False
+        self._last = [None] * (self.LINES * self.MAX_PANELS)
+        self._panel_widths = [self._usage_w]
+        self._details = None
+        self._detail_tree = None
+        self._detail_summary = None
         cv = self.cv = tk.Canvas(root, width=self._fix_w, height=self._fix_h,
                                  highlightthickness=0, bd=0, bg=self.BG)
         cv.pack()
@@ -943,8 +982,11 @@ class FloatingBar(threading.Thread):
                        cv.create_text(self.PAD, y, anchor="e", font=f, text="",
                                       fill=self._pal["value"]),
                        cv.create_text(self.PAD, y, anchor="w", font=f, text="",
+                                      fill=self._pal["time"]),
+                       cv.create_text(self.PAD, y, anchor="w", text="",
+                                      font=self._font_small,
                                       fill=self._pal["time"]))
-                      for y in self._ys]
+                      for _ in range(self.MAX_PANELS) for y in self._ys]
         for w in (root, cv):
             w.bind("<Button-1>", self._press)
             w.bind("<B1-Motion>", self._drag)
@@ -1008,11 +1050,39 @@ class FloatingBar(threading.Thread):
                                0, 0, 0, 0, 0x0013)  # NOSIZE|NOMOVE|NOACTIVATE
                 raise_now = True
                 log.info("bar topmost -> True")
+            if not raise_now and not self._above_tray(u, hwnd):
+                # 캡처 오버레이가 닫힐 때 Windows가 작업표시줄을 밴드 맨 위로
+                # 되올리며 바 위로 올라탄다(실측: 이때 바는 '표시 중'인데
+                # 작업표시줄 뒤라 안 보이고, 60초 주기 재정렬 때야 돌아왔다)
+                raise_now = True
+                if time.time() - self._sunk_log_at > 5:
+                    self._sunk_log_at = time.time()
+                    log.info("bar sank below taskbar - re-raising")
             if raise_now:
                 u.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(0),
                                0, 0, 0, 0, 0x0013)  # HWND_TOP — 작업표시줄 위로
         except Exception:
             log.exception("topmost sync failed")
+
+    def _above_tray(self, u, hwnd):
+        """바가 작업표시줄보다 z 위에 있는가 — 작업표시줄에서 위로 걸어 찾는다.
+
+        위로 걷다 바를 만나면 위에 있는 것이고, 꼭대기까지 못 만나면
+        작업표시줄 아래로 가라앉은 것이다.
+        """
+        u.GetWindow.restype = ctypes.c_void_p
+        u.FindWindowW.restype = ctypes.c_void_p
+        tray = u.FindWindowW("Shell_TrayWnd", None)
+        if not tray or not hwnd:
+            return True
+        h = tray
+        for _ in range(64):
+            h = u.GetWindow(ctypes.c_void_p(h), 3)  # GW_HWNDPREV — 한 칸 위
+            if not h:
+                return False
+            if h == hwnd:
+                return True
+        return True     # 밴드에 창이 이례적으로 많으면 판단 보류 (오탐 방지)
 
     def _probe(self):
         """바 옆 작업표시줄 픽셀 몇 개의 평균 — 배경이 바뀌었는지 감지용.
@@ -1054,7 +1124,21 @@ class FloatingBar(threading.Thread):
             force = True    # 옆 픽셀이 그대로여도 오래되면 한 번 다시 맞춘다
         rgb = self._probe()
         if rgb is None:
+            # 조용히 포기하면 바가 임시 배경(#1f1f1f) 그대로 검게 남는다 —
+            # 원인 추적이 되도록 창당 한 번은 남긴다. 재시도는 틱이 한다.
+            if self._bgimg is None and not self._probe_warned:
+                self._probe_warned = True
+                log.info("camo probe failed at %d,%d",
+                         self.root.winfo_x(), self.root.winfo_y())
             return
+        if self._bgimg is None:
+            # 첫 촬영 전에도 검정을 보여주지 않는다 — 옆 픽셀 색으로 먼저 칠하고
+            # 글자 팔레트도 그 밝기에 맞춘다(촬영은 바로 아래에서 이어진다).
+            solid = "#%02x%02x%02x" % rgb
+            self.root.configure(bg=solid)
+            self.cv.configure(bg=solid)
+            lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+            self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
         if not force:
             if self._rgb and \
                     max(abs(a - b) for a, b in zip(rgb, self._rgb)) <= 3:
@@ -1095,7 +1179,7 @@ class FloatingBar(threading.Thread):
             r, gr, b = img.resize((1, 1)).getpixel((0, 0))[:3]
             lum = 0.299 * r + 0.587 * gr + 0.114 * b
             self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
-            self._last = [None] * self.LINES  # 새 팔레트로 텍스트 다시 그리기
+            self._last = [None] * (self.LINES * self.MAX_PANELS)
             self._camo_at = time.time()
             log.info("bar camo #%02x%02x%02x", r, gr, b)
         except Exception:
@@ -1154,14 +1238,22 @@ class FloatingBar(threading.Thread):
             return
         self._dx = e.x_root - self.root.winfo_x()
         self._dy = e.y_root - self.root.winfo_y()
+        self._press_xy = (e.x_root, e.y_root)
+        self._dragged = False
 
     def _drag(self, e):
         if self.app.cfg.get("bar_locked") or not hasattr(self, "_dx"):
             return
+        if abs(e.x_root - self._press_xy[0]) + abs(e.y_root - self._press_xy[1]) < 4:
+            return
+        self._dragged = True
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
     def _save_pos(self, e):
         if self.app.cfg.get("bar_locked") or not hasattr(self, "_dx"):
+            return
+        if not self._dragged:
+            self._toggle_details()
             return
         self.app.cfg["bar_x"] = self.root.winfo_x()
         self.app.cfg["bar_y"] = self.root.winfo_y()
@@ -1173,11 +1265,37 @@ class FloatingBar(threading.Thread):
         save_config(self.app.cfg)
         self._show(False)
 
-    def _pick(self):
-        """rows에서 [(줄이름, 값)] 세 줄 — 세션 / 주간(모든 모델) / 모델별."""
+    def _skill_panels(self):
+        """실행 중인 앱별 스킬 요약 패널. 줄 = (라벨, 값, 시간, 라벨색, 값색)."""
+        clients, summaries, _ = self.app.skill_tracker.snapshot()
+        panels = []
+        for client in clients:
+            data = summaries.get(client) or {}
+            title = "Claude" if client == "claude" else "Codex"
+            accent = self.ACCENTS.get(client)
+            # 작은 "스킬" 꼬리표 — 사용량 패널의 "Claude 22%"와 안 헷갈리게
+            lines = [(title, f"{data.get('installed', 0)}개", "",
+                      accent, accent, "스킬")]
+            for row in data.get("top", [])[:2]:
+                name = row["name"]
+                if len(name) > 22:
+                    name = name[:20] + "…"
+                lines.append((name, f"{row['total_count']}회", "",
+                              None, None, ""))
+            while len(lines) < self.LINES:
+                lines.append(("실행 기록 없음" if len(lines) == 1 else "",
+                              "", "", None, None, ""))
+            panels.append({"width": self._panel_width(lines), "lines": lines})
+        return panels
+
+    def _usage_panel(self):
+        """예전 사용량 바의 세 줄 — 세션 / 주간(모든 모델) / 모델별."""
+        rows, notice = self.app.rows, self.app.auth_notice
+        if not rows and not notice:
+            return None
         sess = week = model = None
         mname = "모델"
-        for label, pct, reset in self.app.rows:
+        for label, pct, reset in rows:
             if label == "현재 세션" and sess is None:
                 sess = (pct, reset)
             elif label.startswith("주간 (") and week is None:
@@ -1185,7 +1303,192 @@ class FloatingBar(threading.Thread):
             elif label.startswith("주간 ") and model is None:
                 model = (pct, reset)
                 mname = label[3:]           # "주간 Fable" → "Fable"
-        return [("세션", sess), ("주간", week), (mname, model)]
+        lines = []
+        # 첫 줄에 어느 앱의 사용량인지 표기 — Codex 패널과 헷갈리지 않게
+        picks = (("Claude", sess), ("주간", week), (mname, model))
+        for idx, (title, row) in enumerate(picks):
+            if idx == self.LINES - 1 and notice:    # 마지막 줄을 재발급 안내로
+                lines.append((notice, "", "", "#da3633", "#da3633", ""))
+            elif row:
+                pct, reset = row
+                t = short_reset(reset)
+                lines.append((title, f"{round(pct)}%",
+                              f" · {t}" if t else "",
+                              self.ACCENTS["claude"] if idx == 0 else None,
+                              self._value_color(pct), ""))
+            else:
+                lines.append(("", "", "", None, None, ""))
+        return {"width": self._panel_width(lines), "lines": lines}
+
+    def _panels(self):
+        """왼쪽부터 스킬 패널들, 맨 오른쪽(트레이 쪽)은 사용량 패널."""
+        panels = self._skill_panels()
+        usage = self._usage_panel()
+        if usage:
+            panels.append(usage)
+        return panels[:self.MAX_PANELS]
+
+    def _label_block(self, row):
+        """라벨 + 작은 꼬리표("스킬")가 차지하는 폭."""
+        w = self._font.measure(row[0])
+        if len(row) > 5 and row[5]:
+            w += self._font_small.measure(row[5]) + 4
+        return w
+
+    def _panel_width(self, lines):
+        """패널 내용에 꼭 맞는 폭 — 패널 사이 간격이 PANEL_GAP으로 균일해진다."""
+        f = self._font
+        label_w = max(self._label_block(row) for row in lines)
+        value_w = max([f.measure(row[1]) for row in lines if row[1]] or [0])
+        when_w = max([f.measure(row[2]) for row in lines if row[2]] or [0])
+        return label_w + self._col_gap + value_w + when_w + 2 * self.PAD
+
+    def _fit_widths(self, widths):
+        """폭이 조금 준 것은 유지 — '3분 후'→'2분 후' 같은 분 단위 변화로
+        매번 리사이즈(배경 재촬영·위치 저장)하지 않게. 늘어난 것은 즉시 반영해
+        글자가 옆 패널을 침범하지 않는다."""
+        if len(widths) != len(self._panel_widths):
+            return widths
+        return [old if new <= old and old - new <= 16 else new
+                for new, old in zip(widths, self._panel_widths)]
+
+    def _resize_panels(self, widths):
+        if widths == self._panel_widths:
+            return
+        old_w = self._fix_w
+        self._panel_widths = list(widths)
+        self._fix_w = sum(widths) + self.PANEL_GAP * (len(widths) - 1)
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        # 오른쪽 끝을 고정해 패널이 늘 때 트레이 쪽이 아니라 왼쪽으로 자란다.
+        x += old_w - self._fix_w
+        self.cv.configure(width=self._fix_w)
+        self.root.geometry(f"{self._fix_w}x{self._fix_h}+{x}+{y}")
+        self.app.cfg["bar_x"] = x
+        self.app.cfg["bar_y"] = y
+        save_config(self.app.cfg)
+        self._bgimg = None
+        self._last = [None] * (self.LINES * self.MAX_PANELS)
+        self.root.update_idletasks()    # 새 geometry가 잡힌 뒤에 배경을 뜬다
+        self._match_background(force=True)
+
+    def _toggle_details(self):
+        if self._details is not None:
+            try:
+                if self._details.winfo_exists():
+                    self._details.destroy()
+                    self._details = None
+                    return
+            except Exception:
+                self._details = None
+        self._open_details()
+
+    def _open_details(self):
+        import tkinter as tk
+        from tkinter import ttk
+
+        win = self._details = tk.Toplevel(self.root)
+        win.title("AI 스킬 사용 내역")
+        win.overrideredirect(True)
+        win.configure(bg="#f4f5f7", highlightbackground="#d9dce1",
+                      highlightthickness=1)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+
+        width, height = 640, 370
+        x = max(8, min(self.root.winfo_x() + self._fix_w - width,
+                       self.root.winfo_screenwidth() - width - 8))
+        y = max(8, self.root.winfo_y() - height - 10)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+
+        head = tk.Frame(win, bg="#ffffff", height=54)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        tk.Label(head, text="AI Skill Activity", bg="#ffffff", fg="#202124",
+                 font=("Segoe UI Semibold", 14)).pack(side="left", padx=(18, 8))
+        self._detail_summary = tk.Label(
+            head, text="", bg="#ffffff", fg="#6b7280",
+            font=("맑은 고딕", 9)
+        )
+        self._detail_summary.pack(side="left", pady=(3, 0))
+        tk.Button(head, text="×", command=self._toggle_details, relief="flat",
+                  borderwidth=0, bg="#ffffff", activebackground="#eeeeee",
+                  fg="#6b7280", font=("Segoe UI", 15), cursor="hand2"
+                  ).pack(side="right", padx=14)
+
+        note = tk.Label(
+            win,
+            text="자동 = 모델 호출  ·  수동 = /skill 또는 $skill  ·  ~ = Codex 추정",
+            bg="#f4f5f7", fg="#7b818a", anchor="w", font=("맑은 고딕", 8),
+        )
+        note.pack(fill="x", padx=18, pady=(10, 6))
+
+        style = ttk.Style(win)
+        style.configure("Skill.Treeview", rowheight=27, borderwidth=0,
+                        font=("맑은 고딕", 9), background="#ffffff",
+                        fieldbackground="#ffffff", foreground="#30343b")
+        style.configure("Skill.Treeview.Heading", font=("맑은 고딕", 8),
+                        foreground="#69707a", background="#eef0f3")
+        style.map("Skill.Treeview", background=[("selected", "#e8f0fe")],
+                  foreground=[("selected", "#202124")])
+        cols = ("app", "skill", "auto", "manual", "estimated", "total", "last")
+        tree = self._detail_tree = ttk.Treeview(
+            win, columns=cols, show="headings", style="Skill.Treeview", height=9
+        )
+        labels = {
+            "app": "앱", "skill": "스킬", "auto": "자동", "manual": "수동",
+            "estimated": "~추정", "total": "합계", "last": "마지막 실행",
+        }
+        widths = {
+            "app": 66, "skill": 242, "auto": 48, "manual": 48,
+            "estimated": 48, "total": 48, "last": 105,
+        }
+        for col in cols:
+            tree.heading(col, text=labels[col])
+            tree.column(col, width=widths[col], minwidth=widths[col],
+                        anchor="w" if col in {"app", "skill", "last"} else "center")
+        tree.tag_configure("claude", foreground="#a54f36")
+        tree.tag_configure("codex", foreground="#176b63")
+        tree.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        win.bind("<Escape>", lambda e: self._toggle_details())
+        self._refresh_details()
+
+    def _refresh_details(self):
+        if self._details is None or self._detail_tree is None:
+            return
+        try:
+            if not self._details.winfo_exists():
+                self._details = None
+                return
+        except Exception:
+            self._details = None
+            return
+        _, _, rows = self.app.skill_tracker.snapshot()
+        tree = self._detail_tree
+        tree.delete(*tree.get_children())
+        total_today = sum(row["today_count"] for row in rows)
+        installed = sum(1 for row in rows if row["copies"])
+        if self._detail_summary is not None:
+            self._detail_summary.configure(
+                text=f"설치 {installed}개  ·  오늘 {total_today}회"
+            )
+        for row in rows:
+            last = ""
+            if row["last_used"]:
+                last = time.strftime("%m/%d %H:%M",
+                                     time.localtime(row["last_used"]))
+            tree.insert(
+                "", "end",
+                values=(
+                    "Claude" if row["client"] == "claude" else "Codex",
+                    row["name"], row["auto_count"], row["manual_count"],
+                    row["estimated_count"], row["total_count"], last,
+                ),
+                tags=(row["client"],),
+            )
 
     def _tick(self):
         if self.app.stop_evt.is_set():
@@ -1229,11 +1532,18 @@ class FloatingBar(threading.Thread):
             return
         try:
             if self._shown and _fullscreen_now():
+                self._log_hide("watch")
                 self._show(False)
                 self._fs_hidden = True
                 if not self._watching:
                     self._watching = True
                     self.root.after(self.RESTORE_MS, self._watch_restore)
+            elif self._shown and _tray_topmost():
+                # z침몰 보험 — 창 이벤트가 없어도 100ms 안에는 되올라온다
+                u = ctypes.windll.user32
+                if not self._above_tray(u, self._hwnd):
+                    u.SetWindowPos(ctypes.c_void_p(self._hwnd),
+                                   ctypes.c_void_p(0), 0, 0, 0, 0, 0x0013)
         except Exception:
             log.exception("hide watch failed")
         self.root.after(self.HIDE_MS, self._watch_hide)
@@ -1284,6 +1594,7 @@ class FloatingBar(threading.Thread):
                 u.ShowWindow(ctypes.c_void_p(self._hwnd), 0)    # SW_HIDE
                 self._shown = False
                 self._fs_hidden = True
+                self._hide_pending_log = True   # 로그는 틱이 남긴다 (Tk 금지)
             elif (not self._shown and self._fs_hidden and not full
                   and self.app.cfg.get("bar_visible", True)):
                 u.ShowWindow(ctypes.c_void_p(self._hwnd), 4)    # SHOWNOACTIVATE
@@ -1292,6 +1603,12 @@ class FloatingBar(threading.Thread):
                 self._shown = True
                 self._fs_hidden = False
                 self._restore = True
+            elif (self._shown and not full and _tray_topmost()
+                  and not self._above_tray(u, self._hwnd)):
+                # 캡처 오버레이가 닫히는 순간 작업표시줄이 바 위로 올라탄다 —
+                # 다음 틱(최대 0.5초)을 기다리지 않고 이 이벤트에서 바로 되올린다
+                u.SetWindowPos(ctypes.c_void_p(self._hwnd), ctypes.c_void_p(0),
+                               0, 0, 0, 0, 0x0013)              # HWND_TOP
         except Exception:
             pass                    # 콜백에서 로그를 쏟지 않는다
 
@@ -1300,9 +1617,22 @@ class FloatingBar(threading.Thread):
         # 콜백에서 쓸 창 핸들은 여기(Tk 스레드)서만 구한다
         u0 = ctypes.windll.user32
         self._hwnd = u0.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+        if self._hide_pending_log:
+            self._hide_pending_log = False
+            self._log_hide("hook")
+        if self.app.details_requested.is_set():
+            self.app.details_requested.clear()
+            self._toggle_details()
         if not self.app.cfg.get("bar_visible", True):
             self._show(False)
             return
+        panels = self._panels()
+        if not panels:
+            self._show(False)
+            if self._details is not None:
+                self._refresh_details()
+            return
+        self._resize_panels(self._fit_widths([p["width"] for p in panels]))
         covered, snip = _taskbar_covered()
         if self._snip_active and not snip:
             self._recapture = True  # 캡처가 끝났으면 그동안의 변화를 다시 입는다
@@ -1316,6 +1646,8 @@ class FloatingBar(threading.Thread):
         self._covered = self._covered + 1 if hide else 0
         self._clear = 0 if hide else self._clear + 1
         if fullscreen or self._covered >= 2:    # 픽셀 판정만 2회 연속을 요구한다
+            if self._shown:
+                self._log_hide("tick", fullscreen)
             self._show(False)
             self._fs_hidden = bool(fullscreen)  # 되살릴 수 있는 건 이 경우뿐
             if self._fs_hidden and not self._watching:
@@ -1334,48 +1666,69 @@ class FloatingBar(threading.Thread):
             self._match_background(force=True)
         elif self._ticks % self.CAMO_EVERY == 0:
             self._match_background()    # 재촬영은 2회 연속 변했을 때만
-        lines = self._pick()
-        notice = self.app.auth_notice
-        cols = self._columns(lines)
-        for idx, (title, row) in enumerate(lines):
-            if idx == len(lines) - 1 and notice:    # 마지막 줄을 재발급 안내로
-                self._set_line(idx, notice, "", "", "#da3633", cols,
-                               lcolor="#da3633")
-            elif row:
-                pct, reset = row
-                t = short_reset(reset)
-                self._set_line(idx, title, f"{round(pct)}%",
-                               f" · {t}" if t else "", self._value_color(pct),
-                               cols)
-            else:
-                self._set_line(idx, "", "", "", self._pal["value"], cols)
+        elif self._bgimg is None:
+            self._match_background(force=True)  # 첫 배경을 얻기까지 매 틱 재시도
+        base = 0
+        for panel_idx, panel in enumerate(panels):
+            lines = panel["lines"]
+            cols = self._columns(lines, base)
+            for row_idx, (label, value, when, lcolor, vcolor, tag) in \
+                    enumerate(lines):
+                flat_idx = panel_idx * self.LINES + row_idx
+                self._set_line(flat_idx, label, value, when,
+                               vcolor or self._pal["value"], cols, base,
+                               lcolor=lcolor, tag=tag)
+            # 적용된 폭 기준 — _fit_widths가 유지시킨 폭과 어긋나지 않게
+            base += self._panel_widths[panel_idx] + self.PANEL_GAP
+        for panel_idx in range(len(panels), self.MAX_PANELS):
+            for row_idx in range(self.LINES):
+                flat_idx = panel_idx * self.LINES + row_idx
+                self._set_line(flat_idx, "", "", "", self._pal["value"],
+                               (self.PAD, self.PAD), 0)
+        self._refresh_details()
         self._show(True)
         self._apply_lock()
 
-    def _columns(self, lines):
+    def _columns(self, lines, base=0):
         """세 줄이 같은 열에 서도록 (값 오른쪽끝 x, 시간 시작 x)를 구한다."""
         f = self._font
-        gap = f.measure(" ")
-        label_w = max([f.measure(t) for t, _ in lines] or [0])
-        value_w = max([f.measure(f"{round(r[0])}%") for _, r in lines if r]
-                      or [f.measure("100%")])
-        end = self.PAD + label_w + gap + value_w
+        label_w = max([self._label_block(row) for row in lines] or [0])
+        value_w = max([f.measure(row[1]) for row in lines if row[1]]
+                      or [f.measure("999회")])
+        end = base + self.PAD + label_w + self._col_gap + value_w
         return (end, end)
 
-    def _set_line(self, idx, label, value, when, vcolor, cols, lcolor=None):
+    def _set_line(self, idx, label, value, when, vcolor, cols, base,
+                  lcolor=None, tag=""):
         """실제로 달라졌을 때만 캔버스 텍스트를 다시 그린다."""
-        key = (label, value, when, vcolor, lcolor, cols, id(self._pal))
+        key = (label, value, when, vcolor, lcolor, cols, base, tag,
+               id(self._pal))
         if self._last[idx] == key:
             return
         self._last[idx] = key
-        l, v, w = self.items[idx]
+        l, v, w, tg = self.items[idx]
         self.cv.itemconfigure(l, text=label, fill=lcolor or self._pal["label"])
         self.cv.itemconfigure(v, text=value, fill=vcolor)
         self.cv.itemconfigure(w, text=when, fill=self._pal["time"])
-        y = self._ys[idx]
-        self.cv.coords(l, self.PAD, y)
+        self.cv.itemconfigure(tg, text=tag, fill=lcolor or self._pal["label"])
+        y = self._ys[idx % self.LINES]
+        self.cv.coords(l, base + self.PAD, y)
+        self.cv.coords(tg, base + self.PAD + self._font.measure(label) + 4, y)
         self.cv.coords(v, cols[0], y)      # 값은 오른쪽 정렬 — 끝이 맞는다
         self.cv.coords(w, cols[1], y)
+
+    def _log_hide(self, who, fullscreen=None):
+        """바가 숨는 순간의 판단 근거 — 캡처류 오탐이 재발하면 이 줄로 원인을 본다."""
+        try:
+            fg, top = _foreground_pair()
+            log.info(
+                "bar hide (%s): fs=%s cover=%d tray_top=%s fs_fg=%s "
+                "snip_age=%.1fs fg=%s/%s", who, fullscreen, self._covered,
+                _tray_topmost(), _fullscreen_foreground(),
+                time.time() - _last_snip_at,
+                _window_exe(fg) if fg else "", _window_exe(top) if top else "")
+        except Exception:
+            pass
 
     def _win_show(self, on):
         """표시·숨김은 Win32로 직접 한다 — Tk의 deiconify/withdraw를 안 쓴다.
@@ -1425,6 +1778,10 @@ class TrayApp:
         self._updating = False
         self.icon = None
         self.cfg = load_config()
+        self.skill_tracker = TrackerService()
+        self.details_requested = threading.Event()
+        if os.environ.get("SKILL_WIDGET_SHOW_DETAILS") == "1":
+            self.details_requested.set()
 
         self._load_file(initial=True)   # 켜자마자 마지막 값 표시
         if not self.rows:
@@ -1516,6 +1873,8 @@ class TrayApp:
     # ---------------- 업데이트
     def _check_update(self):
         """CHANGELOG의 최신 버전이 내 버전보다 높으면 알림 + 메뉴 항목 준비."""
+        if getattr(sys, "frozen", False):
+            return  # exe 배포본은 설치 프로그램으로만 안전하게 갱신한다
         entries = parse_changelog(fetch_changelog())
         if not entries:
             return
@@ -1608,18 +1967,9 @@ class TrayApp:
         last_attempt = 0.0
         api_denied_reason = None
         api_ok = False
-        claude_gone_at = None
         while not self.stop_evt.is_set():
             now = time.time()
             try:
-                if claude_running():
-                    claude_gone_at = None
-                elif claude_gone_at is None:
-                    claude_gone_at = now
-                elif now - claude_gone_at >= 10:
-                    log.info("claude not running - exiting with it")
-                    self.q.put(("quit",))
-                    break
                 if self.force_api.is_set():
                     self.force_api.clear()
                     next_api = 0.0
@@ -1746,6 +2096,16 @@ class TrayApp:
             self.wake.wait(POLL_SEC)
             self.wake.clear()
 
+    def _skill_loop(self):
+        first = True
+        while not self.stop_evt.is_set():
+            try:
+                self.skill_tracker.refresh(force=first)
+                first = False
+            except Exception:
+                log.exception("skill tracker refresh failed")
+            self.stop_evt.wait(2)
+
     # ---------------- 트레이
     def _menu_lines(self):
         import pystray
@@ -1784,6 +2144,8 @@ class TrayApp:
         return pystray.Menu(
             *self._menu_lines(),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("스킬 사용 내역 열기",
+                             lambda i, it: self.q.put(("details",))),
             *upd,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
             *dbg,
@@ -1848,6 +2210,7 @@ class TrayApp:
             t.daemon = True
             t.start()
         threading.Thread(target=self._poll_loop, daemon=True).start()
+        threading.Thread(target=self._skill_loop, daemon=True).start()
         threading.Thread(target=self._singleton_listener, daemon=True).start()
         FloatingBar(self).start()
 
@@ -1904,6 +2267,8 @@ class TrayApp:
                 self.cfg["bar_visible"] = not self.cfg.get("bar_visible", True)
                 save_config(self.cfg)
                 self._refresh_tray()
+            elif kind == "details":
+                self.details_requested.set()
             elif kind == "lock":
                 self.cfg["bar_locked"] = not self.cfg.get("bar_locked")
                 save_config(self.cfg)
@@ -1941,7 +2306,7 @@ class TrayApp:
     def run(self):
         import pystray
         self.icon = pystray.Icon(APP_NAME, make_icon_image(self._worst()),
-                                 "Claude 사용량", self._build_menu())
+                                 "Claude · Codex 스킬 활동", self._build_menu())
         self.icon.run(setup=self._pump)
 
 
