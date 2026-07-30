@@ -26,7 +26,7 @@ import urllib.error
 
 from skill_tracker import TrackerService
 
-__version__ = "3.5.0"
+__version__ = "3.5.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1216,22 +1216,29 @@ class FloatingBar(threading.Thread):
             log.exception("lock apply failed")
 
     def _place_initial(self):
+        """위치는 오른쪽 끝(트레이 쪽) 기준으로 복원한다.
+
+        왼쪽 끝을 저장하면 시작 직후(패널 폭이 아직 좁을 때) 그 좌표에 놓였다가
+        패널이 붙으며 왼쪽으로 자라서, 재시작 한 번마다 바 전체가 스킬 패널
+        폭만큼 왼쪽으로 밀렸다(실측: 하루 새 1985→1550). 오른쪽 끝을 앵커로
+        저장하면 폭이 어떻게 변해도 사용자가 지정한 자리가 유지된다.
+        """
         w, h = self._fix_w, self._fix_h
-        x, y = self.app.cfg.get("bar_x"), self.app.cfg.get("bar_y")
+        right, y = self.app.cfg.get("bar_right"), self.app.cfg.get("bar_y")
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         r = ctypes.wintypes.RECT()
         ctypes.windll.user32.SystemParametersInfoW(0x0030, 0,
                                                    ctypes.byref(r), 0)
-        if x is None:
-            x = sw - w - 330                       # 트레이 아이콘 왼쪽
+        if right is None:
+            right = sw - 330                       # 트레이 아이콘 왼쪽
         # 줄이 늘어 바가 높아지면 저장된 y로는 화면 아래로 넘친다 — 다시 맞춘다
         if y is None or int(y) + h > sh:
             if sh > r.bottom:                      # 작업표시줄이 아래쪽
                 y = r.bottom + max((sh - r.bottom - h) // 2, 0)
             else:
                 y = sh - h - 8
-        self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+        self.root.geometry(f"{w}x{h}+{int(right) - w}+{int(y)}")
 
     def _press(self, e):
         if self.app.cfg.get("bar_locked"):
@@ -1255,7 +1262,7 @@ class FloatingBar(threading.Thread):
         if not self._dragged:
             self._toggle_details()
             return
-        self.app.cfg["bar_x"] = self.root.winfo_x()
+        self.app.cfg["bar_right"] = self.root.winfo_x() + self._fix_w
         self.app.cfg["bar_y"] = self.root.winfo_y()
         save_config(self.app.cfg)
         self._match_background(force=True)  # 옮긴 자리의 배경으로 다시 위장
@@ -1363,7 +1370,7 @@ class FloatingBar(threading.Thread):
         x += old_w - self._fix_w
         self.cv.configure(width=self._fix_w)
         self.root.geometry(f"{self._fix_w}x{self._fix_h}+{x}+{y}")
-        self.app.cfg["bar_x"] = x
+        self.app.cfg["bar_right"] = x + self._fix_w
         self.app.cfg["bar_y"] = y
         save_config(self.app.cfg)
         self._bgimg = None
