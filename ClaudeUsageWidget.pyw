@@ -27,7 +27,7 @@ import urllib.parse
 
 from skill_tracker import TrackerService
 
-__version__ = "3.6.0"
+__version__ = "3.7.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -130,6 +130,56 @@ def reset_phrase(val):
 def short_reset(val):
     """플로팅 바용 짧은 표기: '3시간 59분 후' / '곧 리셋'."""
     return reset_phrase(val).replace(" 재설정", "").replace("곧", "곧 리셋")
+
+
+# 로컬 SKILL.md가 없는 내장 스킬들의 기본 설명 (한국어로 미리 조사해 내장)
+BUILTIN_DESCS = {
+    "artifact-design": "Claude 내장 — 아티팩트(웹 페이지·문서·시각물)를 만들 때 "
+                       "디자인 완성도 기준과 지침을 불러온다. 요청 성격에 맞춰 "
+                       "디자인 투자 수준을 조정하는 역할.",
+    "artifact-capabilities": "Claude 내장 — 아티팩트가 실행 중 쓸 수 있는 기능"
+                             "(라이브 데이터 읽기, 공유 상태, 자가 갱신 등)의 "
+                             "정의를 불러온다.",
+    "dataviz": "Claude 내장 — 차트·그래프·대시보드를 만들 때 색·형태·접근성 "
+               "규칙을 갖춘 디자인 시스템 지침을 불러온다.",
+    "Presentations": "Codex 내장 — 프레젠테이션(슬라이드) 파일을 만들고 "
+                     "편집하는 스킬.",
+    "Spreadsheets": "Codex 내장 — 스프레드시트(엑셀류) 파일을 만들고 "
+                    "편집하는 스킬.",
+    "visualize": "Codex 내장 — 데이터나 구조를 차트·다이어그램 같은 시각 "
+                 "자료로 그려 보여주는 스킬.",
+    "control-in-app-browser": "Codex 내장 — 앱 안의 브라우저를 조작(페이지 "
+                              "이동·클릭·입력)해 웹 작업을 대신하는 스킬.",
+}
+
+
+def send_to_recycle(path):
+    """파일/폴더를 휴지통으로 — 완전 삭제가 아니라 복구 가능하게."""
+    class _SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", ctypes.c_void_p),
+                    ("wFunc", ctypes.wintypes.UINT),
+                    ("pFrom", ctypes.c_wchar_p),
+                    ("pTo", ctypes.c_wchar_p),
+                    ("fFlags", ctypes.c_ushort),
+                    ("fAnyOperationsAborted", ctypes.wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", ctypes.c_wchar_p)]
+    op = _SHFILEOPSTRUCTW()
+    op.wFunc = 3                                # FO_DELETE
+    op.pFrom = path + "\x00"                    # 이중 널 종료 목록 형식
+    op.fFlags = 0x40 | 0x10 | 0x04              # ALLOWUNDO|NOCONFIRM|SILENT
+    return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0
+
+
+def builtin_desc(name):
+    d = BUILTIN_DESCS.get(name)
+    if d:
+        return d
+    if name.startswith("artifact-template-"):
+        kind = name[len("artifact-template-"):].replace("-", " ")
+        return (f"Codex 내장 템플릿 — {kind} 형태의 아티팩트(보고서·대시보드 "
+                "페이지)를 빠르게 만드는 틀.")
+    return ""
 
 
 def _mostly_korean(text):
@@ -1509,6 +1559,7 @@ class FloatingBar(threading.Thread):
         tree.tag_configure("odd", background="#f7f8fa")
         tree.pack(fill="both", expand=True, padx=18, pady=(0, 8))
         tree.bind("<<TreeviewSelect>>", self._on_detail_select)
+        tree.bind("<Button-3>", self._detail_context)
 
         row = tk.Frame(win, bg="#f4f5f7")
         row.pack(fill="x", padx=18, pady=(0, 4))
@@ -1609,7 +1660,12 @@ class FloatingBar(threading.Thread):
         self._render_desc()
 
     def _render_desc(self):
-        """설명 패널 갱신 — 한국어 모드면 영어 설명을 번역해(캐시) 보여준다."""
+        """설명 패널 갱신 — 한국어 모드면 영어 설명을 번역해 보여준다.
+
+        번역은 3단 캐시: 메모리 → DB(재시작해도 유지, 원문 해시가 바뀌면
+        무효) → 그때만 네트워크. 로컬 SKILL.md가 없는 내장 스킬은
+        내장 기본 설명(한국어)을 쓴다.
+        """
         self._desc_waiting = None
         if self._desc_current is None:
             return
@@ -1617,14 +1673,23 @@ class FloatingBar(threading.Thread):
         title = f"{'Claude' if client == 'claude' else 'Codex'} · {name}"
         desc = self.app.skill_tracker.describe(client, name)
         if not desc:
-            self._set_desc_text(
-                "이 스킬의 SKILL.md에 설명(description)이 없습니다.",
-                title=title, dim=True)
+            b = builtin_desc(name)
+            if b:
+                self._set_desc_text(b + "\n(내장 스킬 — 기본 제공 설명)",
+                                    title=title)
+            else:
+                self._set_desc_text(
+                    "이 스킬의 SKILL.md에 설명(description)이 없습니다.",
+                    title=title, dim=True)
             return
         if self._desc_lang == "en" or _mostly_korean(desc):
             self._set_desc_text(desc, title=title)
             return
         ko = self._trans_cache.get((client, name))
+        if not ko:
+            ko = self.app.skill_tracker.cached_ko(client, name, desc)
+            if ko:
+                self._trans_cache[(client, name)] = ko
         if ko:
             self._set_desc_text(ko, title=title)
             return
@@ -1637,6 +1702,8 @@ class FloatingBar(threading.Thread):
 
     def _translate_worker(self, client, name, text):
         ko = translate_ko(text)
+        if ko:
+            self.app.skill_tracker.store_ko(client, name, text, ko)
         self._trans_cache[(client, name)] = \
             ko or "(번역에 실패했습니다 — '원문' 버튼으로 봐 주세요)"
         self._trans_pending.discard((client, name))
@@ -1645,6 +1712,66 @@ class FloatingBar(threading.Thread):
         """번역 스레드가 끝났으면 설명 패널을 다시 그린다 (틱에서 호출)."""
         if self._desc_waiting and self._desc_waiting in self._trans_cache:
             self._render_desc()
+
+    def _detail_context(self, e):
+        """스킬 우클릭 메뉴 — 폴더 열기 / 휴지통으로 삭제."""
+        import tkinter as tk
+        tree = self._detail_tree
+        if tree is None or self._details is None:
+            return
+        iid = tree.identify_row(e.y)
+        if not iid:
+            return
+        tree.selection_set(iid)
+        client, _, name = iid.partition("|")
+        paths = self.app.skill_tracker.paths(client, name)
+        dirs = sorted({os.path.dirname(p) for p in paths})
+        home = os.path.normcase(HOME)
+        # 사용자 홈 아래 + 스킬 전용 폴더만 삭제 대상 — 루트를 지우는 사고 방지
+        deletable = [
+            d for d in dirs
+            if os.path.normcase(d).startswith(home)
+            and os.path.basename(d).lower() not in
+            ("skills", ".claude", ".codex", "")
+        ]
+        menu = tk.Menu(self._details, tearoff=0)
+        if dirs:
+            menu.add_command(label="폴더 열기",
+                             command=lambda d=dirs[0]: os.startfile(d))
+        if deletable:
+            menu.add_command(
+                label="휴지통으로 삭제…",
+                command=lambda: self._delete_skill(client, name, deletable))
+        else:
+            menu.add_command(label="내장 스킬 — 삭제 불가", state="disabled")
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
+
+    def _delete_skill(self, client, name, dirs):
+        from tkinter import messagebox
+        ok = messagebox.askyesno(
+            "스킬 삭제",
+            f"'{name}' 스킬 폴더를 휴지통으로 보낼까요?\n\n"
+            + "\n".join(dirs)
+            + "\n\n(휴지통에서 언제든 복구할 수 있습니다)",
+            parent=self._details)
+        if not ok:
+            return
+        failed = [d for d in dirs if not send_to_recycle(d)]
+        try:
+            self.app.skill_tracker.refresh(force=True)
+        except Exception:
+            log.exception("refresh after skill delete failed")
+        self._detail_rows_key = None
+        self._refresh_details()
+        log.info("skill deleted to recycle bin: %s/%s (%d/%d dirs)",
+                 client, name, len(dirs) - len(failed), len(dirs))
+        if failed:
+            messagebox.showwarning(
+                "스킬 삭제", "일부 폴더를 옮기지 못했습니다:\n"
+                + "\n".join(failed), parent=self._details)
 
     def _refresh_details(self):
         if self._details is None or self._detail_tree is None:

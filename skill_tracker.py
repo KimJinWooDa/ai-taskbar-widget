@@ -118,6 +118,15 @@ def _connect() -> sqlite3.Connection:
             offset INTEGER NOT NULL,
             updated_at REAL NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS translations (
+            client TEXT NOT NULL,
+            name TEXT NOT NULL,
+            src_hash TEXT NOT NULL,
+            desc_ko TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (client, name)
+        );
         """
     )
     try:
@@ -512,6 +521,52 @@ def _frontmatter_description(path: str) -> str:
     return desc
 
 
+def desc_hash(text: str) -> str:
+    import hashlib
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def cached_translation(client: str, name: str, src_hash: str) -> str:
+    """저장된 한국어 번역 — 원문 해시가 다르면(설명이 바뀌면) 무효."""
+    try:
+        with closing(_connect()) as con:
+            row = con.execute(
+                "SELECT desc_ko FROM translations "
+                "WHERE client = ? AND name = ? AND src_hash = ?",
+                (client, name, src_hash),
+            ).fetchone()
+    except sqlite3.Error:
+        return ""
+    return row[0] if row else ""
+
+
+def store_translation(client: str, name: str, src_hash: str,
+                      desc_ko: str) -> None:
+    try:
+        with closing(_connect()) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO translations"
+                "(client, name, src_hash, desc_ko, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (client, name, src_hash, desc_ko, time.time()),
+            )
+            con.commit()
+    except sqlite3.Error:
+        pass
+
+
+def skill_paths(client: str, name: str) -> list[str]:
+    """스킬의 SKILL.md 파일 경로들 (사본이 여러 곳이면 전부)."""
+    try:
+        with closing(_connect()) as con:
+            rows = con.execute(
+                "SELECT path FROM skills WHERE client = ? AND name = ? "
+                "ORDER BY path", (client, name)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [r[0] for r in rows]
+
+
 def skill_description(client: str, name: str) -> str:
     """설치된 스킬의 SKILL.md description — 사본이 여럿이면 첫 파일 기준."""
     try:
@@ -564,6 +619,15 @@ class TrackerService:
         if key not in self._desc_cache:
             self._desc_cache[key] = skill_description(client, name)
         return self._desc_cache[key]
+
+    def cached_ko(self, client: str, name: str, src: str) -> str:
+        return cached_translation(client, name, desc_hash(src))
+
+    def store_ko(self, client: str, name: str, src: str, ko: str) -> None:
+        store_translation(client, name, desc_hash(src), ko)
+
+    def paths(self, client: str, name: str) -> list[str]:
+        return skill_paths(client, name)
 
     def refresh(self, force=False):
         now = time.time()
