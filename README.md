@@ -1,8 +1,9 @@
 <div align="center">
 
-# AI Skill Widget
+# AI Taskbar Widget
 
-**Claude Code와 Codex의 스킬 설치·호출 현황을 보여주는 Windows 작업표시줄 위젯**
+**Claude 사용량(세션·주간 잔량)과 Claude Code·Codex 스킬 활동을 한 줄로 보여주는
+Windows 작업표시줄 위젯**
 
 [![Platform](https://img.shields.io/badge/Windows_10%2F11-0078d4?style=flat-square)](#)
 [![Runtime](https://img.shields.io/badge/Standalone_EXE-no_Python-2ea043?style=flat-square)](#)
@@ -12,11 +13,13 @@
 
 ## 화면 구성
 
-- Claude만 실행 중이면 Claude 패널만 표시합니다.
-- Codex만 실행 중이면 Codex 패널만 표시합니다.
-- 둘 다 실행 중이면 높이는 그대로 두고 두 패널을 좌우로 붙입니다.
+- 바 맨 오른쪽(트레이 쪽)에는 Claude 사용량 패널(세션·주간·모델별 잔량)이
+  항상 표시됩니다.
+- 그 왼쪽에 실행 중인 앱의 스킬 패널이 붙습니다 — Claude만, Codex만, 또는 둘 다.
+- 패널 폭은 내용에 맞춰 계산돼 간격이 균일하고, 앱이 꺼지면 빈자리 없이
+  당겨집니다.
 - 앱이 모두 꺼지면 바만 숨고 백그라운드에서 다음 실행을 기다립니다.
-- 얇은 바에는 앱별 설치 수·오늘 호출 수·상위 스킬 2개만 표시합니다.
+- 얇은 바에는 앱별 설치 수·상위 스킬 2개만 표시합니다.
 - 바를 클릭하거나 트레이 메뉴의 `스킬 사용 내역 열기`를 누르면 전체 목록이
   작업표시줄 위 팝업으로 열립니다.
 - `바 위치 잠금`이 켜져 클릭이 통과하는 상태에서는 트레이 메뉴로 엽니다.

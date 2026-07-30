@@ -50,11 +50,11 @@ BLINK_EVERY = 9                 # 초 — 이 간격으로 한 번씩 눈을 깜
 BLINK_HOLD = 0.13               # 감고 있는 시간. 계속 움직이면 CPU를 먹는다
 SINGLETON_PORT = 53917
 
-REPO = "KimJinWooDa/claude-taskbar-widget"
+REPO = "KimJinWooDa/ai-taskbar-widget"
 CHANGELOG_URL = f"https://raw.githubusercontent.com/{REPO}/main/CHANGELOG.md"
 CHANGELOG_PAGE = f"https://github.com/{REPO}/blob/main/CHANGELOG.md"
 REPO_ZIP_URL = f"https://github.com/{REPO}/archive/refs/heads/main.zip"
-REPO_ZIP_TOPDIR = "claude-taskbar-widget-main"
+REPO_ZIP_TOPDIR = "ai-taskbar-widget-main"
 UPDATE_CHECK_SEC = 24 * 3600
 
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", HOME), APP_NAME)
