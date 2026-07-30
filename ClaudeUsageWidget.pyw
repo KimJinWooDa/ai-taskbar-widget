@@ -26,7 +26,7 @@ import urllib.error
 
 from skill_tracker import TrackerService
 
-__version__ = "3.4.1"
+__version__ = "3.5.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1614,6 +1614,12 @@ class FloatingBar(threading.Thread):
 
     def _update(self):
         self._ticks += 1
+        if self._ticks % 600 == 0:
+            # 5분 심장박동 — "로그가 조용한 채 바가 안 보이던" 구간의 원인 추적용
+            # (2026-07-30 저녁, 시작 후 17분간 아무 로그 없이 안 보인 사례)
+            log.info("hb shown=%s fs_hidden=%s covered=%d clear=%d panels=%d",
+                     self._shown, self._fs_hidden, self._covered, self._clear,
+                     len(self._panel_widths))
         # 콜백에서 쓸 창 핸들은 여기(Tk 스레드)서만 구한다
         u0 = ctypes.windll.user32
         self._hwnd = u0.GetParent(self.root.winfo_id()) or self.root.winfo_id()
@@ -1725,7 +1731,7 @@ class FloatingBar(threading.Thread):
                 "bar hide (%s): fs=%s cover=%d tray_top=%s fs_fg=%s "
                 "snip_age=%.1fs fg=%s/%s", who, fullscreen, self._covered,
                 _tray_topmost(), _fullscreen_foreground(),
-                time.time() - _last_snip_at,
+                min(time.time() - _last_snip_at, 99999.0),
                 _window_exe(fg) if fg else "", _window_exe(top) if top else "")
         except Exception:
             pass

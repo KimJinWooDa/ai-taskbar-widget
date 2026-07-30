@@ -24,10 +24,16 @@ Get-Process -Name "AI-Skill-Widget" -ErrorAction SilentlyContinue |
 Copy-Item $widgetSource $widget -Force
 Copy-Item $hookSource $hook -Force
 
-Write-Host "[2/4] Windows 시작 프로그램 등록"
-New-Item -ItemType Directory -Path $startupDir -Force | Out-Null
-$vbs = 'CreateObject("Wscript.Shell").Run """' + $widget + '""", 0, False'
-[IO.File]::WriteAllText($startupVbs, $vbs, [Text.Encoding]::Unicode)
+Write-Host "[2/4] Windows 시작 프로그램 등록 (로그온 예약 작업)"
+# 시작프로그램 폴더는 Windows가 수십 초 늦게 실행한다(실측 44초) —
+# 로그온 트리거 예약 작업은 로그온 직후 바로 뜬다. 구버전 vbs는 정리한다.
+Remove-Item $startupVbs -Force -ErrorAction SilentlyContinue
+$taskAction = New-ScheduledTaskAction -Execute $widget
+$taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+Register-ScheduledTask -TaskName "AI Taskbar Widget" -Action $taskAction `
+    -Trigger $taskTrigger -Settings $taskSettings -Force | Out-Null
 
 Write-Host "[3/4] Claude Code 스킬 카운터 훅 병합"
 $claudeDir = Join-Path $env:USERPROFILE ".claude"
@@ -90,6 +96,29 @@ function Add-SkillHook {
 
 Add-SkillHook -EventName "PreToolUse" -Matcher "^Skill$"
 Add-SkillHook -EventName "UserPromptExpansion" -Matcher ""
+
+# Claude 세션이 시작되면 위젯도 켠다 — 이미 떠 있으면 기존 인스턴스에
+# 신호만 보내고 끝난다(단일 인스턴스). cmd start로 분리 실행해 훅은 즉시 끝난다.
+$startCommand = 'cmd /c start "" "' + ($widget -replace '\\', '/') + '"'
+$startGroups = @()
+$startProp = $settings.hooks.PSObject.Properties["SessionStart"]
+if ($startProp) { $startGroups = @($startProp.Value) }
+$startExists = $false
+foreach ($group in $startGroups) {
+    foreach ($handler in @($group.hooks)) {
+        if ($handler.command -like "*AI-Skill-Widget.exe*") { $startExists = $true }
+    }
+}
+if (-not $startExists) {
+    $startGroups += [PSCustomObject]@{
+        matcher = ""
+        hooks = @([PSCustomObject]@{
+            type = "command"; command = $startCommand; timeout = 5
+        })
+    }
+}
+$settings.hooks | Add-Member -MemberType NoteProperty -Name "SessionStart" `
+    -Value @($startGroups) -Force
 
 $json = $settings | ConvertTo-Json -Depth 30
 [IO.File]::WriteAllText(

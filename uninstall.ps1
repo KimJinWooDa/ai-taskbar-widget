@@ -8,17 +8,21 @@ $settingsPath = Join-Path $env:USERPROFILE ".claude\settings.json"
 Get-Process -Name "AI-Skill-Widget" -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item $startupVbs -Force -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "AI Taskbar Widget" `
+    -Confirm:$false -ErrorAction SilentlyContinue
 
 if (Test-Path $settingsPath) {
     $settings = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($settings.PSObject.Properties["hooks"]) {
-        foreach ($eventName in @("PreToolUse", "UserPromptExpansion")) {
+        foreach ($eventName in @("PreToolUse", "UserPromptExpansion",
+                                 "SessionStart")) {
             $prop = $settings.hooks.PSObject.Properties[$eventName]
             if (-not $prop) { continue }
             $kept = @()
             foreach ($group in @($prop.Value)) {
                 $handlers = @($group.hooks | Where-Object {
-                    $_.command -notlike "*SkillEventHook*--client claude*"
+                    $_.command -notlike "*SkillEventHook*--client claude*" -and
+                    $_.command -notlike "*AI-Skill-Widget.exe*"
                 })
                 if ($handlers.Count) {
                     $group.hooks = $handlers
