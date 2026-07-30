@@ -1,6 +1,7 @@
 <div align="center">
 
 # AI Taskbar Widget
+<img width="314" height="47" alt="image" src="https://github.com/user-attachments/assets/8a472c96-a679-48aa-b1d1-8af1dc2f9bd8" />
 
 **Claude 사용량(세션·주간 잔량)과 Claude Code·Codex 스킬 활동을 한 줄로 보여주는
 Windows 작업표시줄 위젯**
