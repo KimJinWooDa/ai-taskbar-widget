@@ -27,7 +27,7 @@ import urllib.parse
 
 from skill_tracker import TrackerService
 
-__version__ = "3.7.0"
+__version__ = "3.7.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1679,7 +1679,8 @@ class FloatingBar(threading.Thread):
                                     title=title)
             else:
                 self._set_desc_text(
-                    "이 스킬의 SKILL.md에 설명(description)이 없습니다.",
+                    "정보 없음 — 이 스킬은 로컬 SKILL.md 설명도, 위젯에 "
+                    "내장된 기본 설명도 없습니다.",
                     title=title, dim=True)
             return
         if self._desc_lang == "en" or _mostly_korean(desc):
