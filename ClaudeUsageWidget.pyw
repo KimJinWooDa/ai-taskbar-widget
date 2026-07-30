@@ -23,10 +23,11 @@ import logging
 import datetime
 import urllib.request
 import urllib.error
+import urllib.parse
 
 from skill_tracker import TrackerService
 
-__version__ = "3.5.1"
+__version__ = "3.6.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -129,6 +130,31 @@ def reset_phrase(val):
 def short_reset(val):
     """플로팅 바용 짧은 표기: '3시간 59분 후' / '곧 리셋'."""
     return reset_phrase(val).replace(" 재설정", "").replace("곧", "곧 리셋")
+
+
+def _mostly_korean(text):
+    """이미 한국어면 번역할 필요가 없다 — 앞부분 한글 비율로 판단."""
+    head = text[:400]
+    hangul = sum("가" <= c <= "힣" for c in head)
+    return hangul >= max(len(head) // 10, 4)
+
+
+def translate_ko(text):
+    """스킬 설명을 한국어로 — 구글 번역 비공식 GET, 실패하면 ''.
+
+    스킬 설명(공개 문서)만 보내며, 결과는 세션 동안 캐시된다.
+    """
+    q = urllib.parse.quote(text[:3000])
+    url = ("https://translate.googleapis.com/translate_a/single"
+           "?client=gtx&sl=auto&tl=ko&dt=t&q=" + q)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
+    except Exception:
+        log.info("translate failed", exc_info=True)
+        return ""
 
 
 def load_config():
@@ -969,6 +995,16 @@ class FloatingBar(threading.Thread):
         self._details = None
         self._detail_tree = None
         self._detail_summary = None
+        self._detail_filter = "all"     # 전체 / claude / codex
+        self._detail_rows_key = None    # 내용이 바뀔 때만 목록을 다시 그린다
+        self._detail_desc = None
+        self._detail_filter_btns = {}
+        self._desc_lang = "kr"          # kr = 영어 설명을 한국어로 번역해 표시
+        self._desc_current = None       # 지금 설명을 보여주는 (client, name)
+        self._desc_waiting = None       # 번역을 기다리는 (client, name)
+        self._lang_btns = {}
+        self._trans_cache = {}
+        self._trans_pending = set()
         cv = self.cv = tk.Canvas(root, width=self._fix_w, height=self._fix_h,
                                  highlightthickness=0, bd=0, bg=self.BG)
         cv.pack()
@@ -1405,7 +1441,7 @@ class FloatingBar(threading.Thread):
         except tk.TclError:
             pass
 
-        width, height = 640, 370
+        width, height = 640, 520
         x = max(8, min(self.root.winfo_x() + self._fix_w - width,
                        self.root.winfo_screenwidth() - width - 8))
         y = max(8, self.root.winfo_y() - height - 10)
@@ -1426,12 +1462,23 @@ class FloatingBar(threading.Thread):
                   fg="#6b7280", font=("Segoe UI", 15), cursor="hand2"
                   ).pack(side="right", padx=14)
 
-        note = tk.Label(
-            win,
-            text="자동 = 모델 호출  ·  수동 = /skill 또는 $skill  ·  ~ = Codex 추정",
-            bg="#f4f5f7", fg="#7b818a", anchor="w", font=("맑은 고딕", 8),
-        )
-        note.pack(fill="x", padx=18, pady=(10, 6))
+        bar = tk.Frame(win, bg="#f4f5f7")
+        bar.pack(fill="x", padx=18, pady=(10, 6))
+        self._detail_filter_btns = {}
+        for key, label in (("all", "전체"), ("claude", "Claude"),
+                           ("codex", "Codex")):
+            b = tk.Button(bar, text=label, relief="flat", borderwidth=0,
+                          cursor="hand2", font=("맑은 고딕", 9), padx=12,
+                          pady=2,
+                          command=lambda k=key: self._set_detail_filter(k))
+            b.pack(side="left", padx=(0, 6))
+            self._detail_filter_btns[key] = b
+        tk.Label(
+            bar,
+            text="자동 = 모델 호출 · 수동 = /skill · ~ = Codex 추정",
+            bg="#f4f5f7", fg="#7b818a", font=("맑은 고딕", 8),
+        ).pack(side="right")
+        self._style_filter_btns()
 
         style = ttk.Style(win)
         style.configure("Skill.Treeview", rowheight=27, borderwidth=0,
@@ -1459,9 +1506,145 @@ class FloatingBar(threading.Thread):
                         anchor="w" if col in {"app", "skill", "last"} else "center")
         tree.tag_configure("claude", foreground="#a54f36")
         tree.tag_configure("codex", foreground="#176b63")
-        tree.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        tree.tag_configure("odd", background="#f7f8fa")
+        tree.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+        tree.bind("<<TreeviewSelect>>", self._on_detail_select)
+
+        row = tk.Frame(win, bg="#f4f5f7")
+        row.pack(fill="x", padx=18, pady=(0, 4))
+        tk.Label(row, text="스킬 설명", bg="#f4f5f7", fg="#69707a",
+                 font=("맑은 고딕", 8)).pack(side="left")
+        self._lang_btns = {}
+        for key, label in (("kr", "한국어"), ("en", "원문")):
+            b = tk.Button(row, text=label, relief="flat", borderwidth=0,
+                          cursor="hand2", font=("맑은 고딕", 8), padx=9, pady=1,
+                          command=lambda k=key: self._set_desc_lang(k))
+            b.pack(side="right", padx=(4, 0))
+            self._lang_btns[key] = b
+        self._style_lang_btns()
+
+        # 선택한 스킬의 SKILL.md description — 무엇에 쓰는 스킬인지
+        desc = self._detail_desc = tk.Text(
+            win, height=6, wrap="word", relief="flat", bg="#ffffff",
+            fg="#30343b", font=("맑은 고딕", 9), padx=12, pady=8,
+            state="disabled", cursor="arrow",
+            highlightbackground="#e3e6ea", highlightthickness=1,
+        )
+        desc.tag_configure("title", font=("맑은 고딕", 9, "bold"),
+                           foreground="#202124", spacing3=4)
+        desc.tag_configure("dim", foreground="#8a9099")
+        desc.pack(fill="x", padx=18, pady=(0, 14))
+        self._set_desc_text("스킬을 클릭하면 설명이 여기 표시됩니다.", dim=True)
+
         win.bind("<Escape>", lambda e: self._toggle_details())
+        self._detail_rows_key = None
         self._refresh_details()
+
+    def _style_filter_btns(self):
+        for key, b in self._detail_filter_btns.items():
+            try:
+                if not b.winfo_exists():
+                    return
+            except Exception:
+                return
+            on = key == self._detail_filter
+            b.configure(bg="#3b4252" if on else "#e8eaee",
+                        fg="#ffffff" if on else "#4b5563",
+                        activebackground="#3b4252" if on else "#dde0e5",
+                        activeforeground="#ffffff" if on else "#4b5563")
+
+    def _set_detail_filter(self, key):
+        if key == self._detail_filter:
+            return
+        self._detail_filter = key
+        self._style_filter_btns()
+        self._detail_rows_key = None
+        self._refresh_details()
+
+    def _set_desc_text(self, body, title=None, dim=False):
+        t = self._detail_desc
+        if t is None:
+            return
+        try:
+            if not t.winfo_exists():
+                return
+        except Exception:
+            return
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        if title:
+            t.insert("end", title + "\n", "title")
+        t.insert("end", body, "dim" if dim else "")
+        t.configure(state="disabled")
+
+    def _on_detail_select(self, event=None):
+        tree = self._detail_tree
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        client, _, name = sel[0].partition("|")
+        self._desc_current = (client, name)
+        self._render_desc()
+
+    def _style_lang_btns(self):
+        for key, b in self._lang_btns.items():
+            try:
+                if not b.winfo_exists():
+                    return
+            except Exception:
+                return
+            on = key == self._desc_lang
+            b.configure(bg="#3b4252" if on else "#e8eaee",
+                        fg="#ffffff" if on else "#4b5563",
+                        activebackground="#3b4252" if on else "#dde0e5",
+                        activeforeground="#ffffff" if on else "#4b5563")
+
+    def _set_desc_lang(self, lang):
+        if lang == self._desc_lang:
+            return
+        self._desc_lang = lang
+        self._style_lang_btns()
+        self._render_desc()
+
+    def _render_desc(self):
+        """설명 패널 갱신 — 한국어 모드면 영어 설명을 번역해(캐시) 보여준다."""
+        self._desc_waiting = None
+        if self._desc_current is None:
+            return
+        client, name = self._desc_current
+        title = f"{'Claude' if client == 'claude' else 'Codex'} · {name}"
+        desc = self.app.skill_tracker.describe(client, name)
+        if not desc:
+            self._set_desc_text(
+                "이 스킬의 SKILL.md에 설명(description)이 없습니다.",
+                title=title, dim=True)
+            return
+        if self._desc_lang == "en" or _mostly_korean(desc):
+            self._set_desc_text(desc, title=title)
+            return
+        ko = self._trans_cache.get((client, name))
+        if ko:
+            self._set_desc_text(ko, title=title)
+            return
+        self._set_desc_text("한국어로 번역 중…", title=title, dim=True)
+        self._desc_waiting = (client, name)
+        if (client, name) not in self._trans_pending:
+            self._trans_pending.add((client, name))
+            threading.Thread(target=self._translate_worker,
+                             args=(client, name, desc), daemon=True).start()
+
+    def _translate_worker(self, client, name, text):
+        ko = translate_ko(text)
+        self._trans_cache[(client, name)] = \
+            ko or "(번역에 실패했습니다 — '원문' 버튼으로 봐 주세요)"
+        self._trans_pending.discard((client, name))
+
+    def _poll_translation(self):
+        """번역 스레드가 끝났으면 설명 패널을 다시 그린다 (틱에서 호출)."""
+        if self._desc_waiting and self._desc_waiting in self._trans_cache:
+            self._render_desc()
 
     def _refresh_details(self):
         if self._details is None or self._detail_tree is None:
@@ -1474,7 +1657,20 @@ class FloatingBar(threading.Thread):
             self._details = None
             return
         _, _, rows = self.app.skill_tracker.snapshot()
+        if self._detail_filter != "all":
+            rows = [r for r in rows if r["client"] == self._detail_filter]
+        # 많이 쓴 순 → 최근 쓴 순 → 이름 순
+        rows = sorted(rows, key=lambda r: (-r["total_count"],
+                                           -(r["last_used"] or 0), r["name"]))
+        key = tuple(
+            (r["client"], r["name"], r["auto_count"], r["manual_count"],
+             r["estimated_count"], r["total_count"], r["last_used"])
+            for r in rows)
+        if key == self._detail_rows_key:
+            return      # 내용 그대로 — 다시 그리면 선택·스크롤이 풀린다
+        self._detail_rows_key = key
         tree = self._detail_tree
+        selected = tree.selection()
         tree.delete(*tree.get_children())
         total_today = sum(row["today_count"] for row in rows)
         installed = sum(1 for row in rows if row["copies"])
@@ -1482,20 +1678,30 @@ class FloatingBar(threading.Thread):
             self._detail_summary.configure(
                 text=f"설치 {installed}개  ·  오늘 {total_today}회"
             )
-        for row in rows:
+        for i, row in enumerate(rows):
             last = ""
             if row["last_used"]:
                 last = time.strftime("%m/%d %H:%M",
                                      time.localtime(row["last_used"]))
+            tags = [row["client"]]
+            if i % 2:
+                tags.append("odd")
             tree.insert(
-                "", "end",
+                "", "end", iid=f"{row['client']}|{row['name']}",
                 values=(
                     "Claude" if row["client"] == "claude" else "Codex",
                     row["name"], row["auto_count"], row["manual_count"],
                     row["estimated_count"], row["total_count"], last,
                 ),
-                tags=(row["client"],),
+                tags=tuple(tags),
             )
+        # 선택 보존 — 없어졌으면 첫 행을 골라 설명이 비지 않게 한다
+        keep = [i for i in selected if tree.exists(i)]
+        children = tree.get_children()
+        if keep:
+            tree.selection_set(keep)
+        elif children:
+            tree.selection_set(children[0])
 
     def _tick(self):
         if self.app.stop_evt.is_set():
@@ -1699,6 +1905,8 @@ class FloatingBar(threading.Thread):
                 self._set_line(flat_idx, "", "", "", self._pal["value"],
                                (self.PAD, self.PAD), 0)
         self._refresh_details()
+        if self._details is not None:
+            self._poll_translation()
         self._show(True)
         self._apply_lock()
 

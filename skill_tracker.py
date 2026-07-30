@@ -477,6 +477,57 @@ def usage_rows(client: str | None = None) -> list[dict]:
         return []
 
 
+def _frontmatter_description(path: str) -> str:
+    """SKILL.md 머리말(frontmatter)의 description 값 — 없으면 ''.
+
+    yaml 라이브러리 없이 처리한다: 한 줄 값, 따옴표 값, `>`/`|` 블록과
+    이어지는 들여쓴 줄까지만 지원하면 실전 스킬 파일은 전부 커버된다.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(65536)
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    parts: list[str] = []
+    in_desc = False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if in_desc:
+            if line[:1] in (" ", "\t"):
+                parts.append(line.strip())
+                continue
+            break
+        if line.startswith("description:"):
+            first = line[len("description:"):].strip()
+            in_desc = True
+            if first not in (">", ">-", "|", "|-", ""):
+                parts.append(first)
+    desc = " ".join(parts).strip()
+    if len(desc) >= 2 and desc[0] in "'\"" and desc[-1] == desc[0]:
+        desc = desc[1:-1]
+    return desc
+
+
+def skill_description(client: str, name: str) -> str:
+    """설치된 스킬의 SKILL.md description — 사본이 여럿이면 첫 파일 기준."""
+    try:
+        with closing(_connect()) as con:
+            row = con.execute(
+                "SELECT path FROM skills WHERE client = ? AND name = ? "
+                "ORDER BY path LIMIT 1",
+                (client, name),
+            ).fetchone()
+    except sqlite3.Error:
+        return ""
+    if not row:
+        return ""
+    return _frontmatter_description(row[0])
+
+
 def compact_summary(client: str) -> dict:
     rows = usage_rows(client)
     installed = sum(1 for row in rows if row["copies"])
@@ -506,6 +557,13 @@ class TrackerService:
         self._rows: list[dict] = []
         self._inventory_at = 0.0
         self._scan_at = 0.0
+        self._desc_cache: dict[tuple[str, str], str] = {}
+
+    def describe(self, client: str, name: str) -> str:
+        key = (client, name)
+        if key not in self._desc_cache:
+            self._desc_cache[key] = skill_description(client, name)
+        return self._desc_cache[key]
 
     def refresh(self, force=False):
         now = time.time()
