@@ -34,6 +34,17 @@ if ($env:CLAUDE_NOTIFY_LOG) {
 }
 $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
+# 한 줄 = 한 알림이 계약이다. 줄바꿈이 섞이면 가짜 항목이 만들어지고, 제목의
+# 파이프는 본문 분리를 어긋나게 한다 — 둘 다 여기서 접는다.
+$Title = ($Title -replace '[\r\n]+', ' ').Trim() -replace '\|', '/'
+$Message = ($Message -replace '[\r\n]+', ' ').Trim()
+
+# 로그가 무한정 자라지 않게 한다. 위젯은 파일이 바뀔 때마다 전체를 다시 읽으므로
+# 길이가 곧 읽기 비용이다. 평상시 알림 빈도로는 몇 년을 써도 안 걸리는 한도지만,
+# 고빈도 루틴을 붙인 사용자에게도 상한이 있어야 한다.
+$MaxLines = 2000
+$KeepLines = 1000
+
 # 1) 기록 먼저 — 알림을 놓치거나 못 띄워도 이건 남는다.
 try {
     $dir = Split-Path -Parent $logPath
@@ -41,6 +52,12 @@ try {
         New-Item -ItemType Directory -Force $dir | Out-Null
     }
     Add-Content -Path $logPath -Value "[$stamp] $Title | $Message" -Encoding UTF8
+
+    $lines = @(Get-Content -LiteralPath $logPath -Encoding UTF8)
+    if ($lines.Count -gt $MaxLines) {
+        $tail = $lines[($lines.Count - $KeepLines)..($lines.Count - 1)]
+        Set-Content -LiteralPath $logPath -Value $tail -Encoding UTF8
+    }
 } catch {
     Write-Output "LOG_FAILED: $($_.Exception.Message)"
 }
