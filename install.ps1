@@ -1,4 +1,4 @@
-# AI Skill Widget installer for Windows 10/11.
+﻿# AI Skill Widget installer for Windows 10/11.
 # Installs the self-contained app, startup entry, and token-free Claude hooks.
 $ErrorActionPreference = "Stop"
 
@@ -17,14 +17,14 @@ $hook = Join-Path $installDir "SkillEventHook.exe"
 $startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
 $startupVbs = Join-Path $startupDir "AI-Skill-Widget.vbs"
 
-Write-Host "[1/4] 앱 설치 -> $installDir"
+Write-Host "[1/5] 앱 설치 -> $installDir"
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Get-Process -Name "AI-Skill-Widget" -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 Copy-Item $widgetSource $widget -Force
 Copy-Item $hookSource $hook -Force
 
-Write-Host "[2/4] Windows 시작 프로그램 등록 (로그온 예약 작업)"
+Write-Host "[2/5] Windows 시작 프로그램 등록 (로그온 예약 작업)"
 # 시작프로그램 폴더는 Windows가 수십 초 늦게 실행한다(실측 44초) —
 # 로그온 트리거 예약 작업은 로그온 직후 바로 뜬다. 구버전 vbs는 정리한다.
 Remove-Item $startupVbs -Force -ErrorAction SilentlyContinue
@@ -35,7 +35,7 @@ $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
 Register-ScheduledTask -TaskName "AI Taskbar Widget" -Action $taskAction `
     -Trigger $taskTrigger -Settings $taskSettings -Force | Out-Null
 
-Write-Host "[3/4] Claude Code 스킬 카운터 훅 병합"
+Write-Host "[3/5] Claude Code 스킬 카운터 훅 병합"
 $claudeDir = Join-Path $env:USERPROFILE ".claude"
 $settingsPath = Join-Path $claudeDir "settings.json"
 New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
@@ -125,7 +125,21 @@ $json = $settings | ConvertTo-Json -Depth 30
     $settingsPath, $json, (New-Object Text.UTF8Encoding $false)
 )
 
-Write-Host "[4/4] 실행"
+Write-Host "[4/5] 루틴 알림 발신 스크립트 설치"
+# 예약 작업(루틴)이 결과 한 줄을 남길 때 쓰는 스크립트. 위젯은 그 로그를 읽어
+# 안 읽은 알림 개수를 작업표시줄에 띄운다. 루틴 쪽 배선은 사용자가 하며,
+# 규약은 README의 "루틴 알림"을 참조한다. 없으면 알림 기능만 조용히 쉰다.
+$tasksDir = Join-Path $claudeDir "scheduled-tasks"
+$notifySource = Join-Path $repo "notify.ps1"
+if (Test-Path $notifySource) {
+    New-Item -ItemType Directory -Path $tasksDir -Force | Out-Null
+    Copy-Item $notifySource (Join-Path $tasksDir "notify.ps1") -Force
+}
+else {
+    Write-Host "  notify.ps1 이 없어 건너뜁니다 (알림 기능만 비활성)." -ForegroundColor Yellow
+}
+
+Write-Host "[5/5] 실행"
 Start-Process -FilePath $widget
 
 Write-Host ""

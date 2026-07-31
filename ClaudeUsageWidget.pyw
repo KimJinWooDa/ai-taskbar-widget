@@ -26,8 +26,10 @@ import urllib.error
 import urllib.parse
 
 from skill_tracker import TrackerService
+from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
+                           ago as notify_ago)
 
-__version__ = "3.7.1"
+__version__ = "3.8.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -973,9 +975,9 @@ class FloatingBar(threading.Thread):
     """
 
     LINES = 3               # 작업표시줄 48px에 12px 줄 3개 + 여백 6px
-    MAX_PANELS = 3          # Claude 스킬 + Codex 스킬 + 사용량
+    MAX_PANELS = 4          # Claude 스킬 + Codex 스킬 + 루틴 알림 + 사용량
     PANEL_GAP = 20
-    ACCENTS = {"claude": "#d97757", "codex": "#45a79a"}
+    ACCENTS = {"claude": "#d97757", "codex": "#45a79a", "notify": "#c58a1a"}
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
     PAD = 8                 # 좌우 여백 — 모든 줄의 라벨이 여기서 시작한다
     TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
@@ -1042,7 +1044,9 @@ class FloatingBar(threading.Thread):
         self._probe_warned = False
         self._last = [None] * (self.LINES * self.MAX_PANELS)
         self._panel_widths = [self._usage_w]
+        self._panel_kinds = ["usage"]
         self._details = None
+        self._notes = None      # 루틴 알림 목록 창
         self._detail_tree = None
         self._detail_summary = None
         self._detail_filter = "all"     # 전체 / claude / codex
@@ -1346,7 +1350,11 @@ class FloatingBar(threading.Thread):
         if self.app.cfg.get("bar_locked") or not hasattr(self, "_dx"):
             return
         if not self._dragged:
-            self._toggle_details()
+            # 알림 패널을 눌렀으면 알림 목록, 그 밖은 기존대로 스킬 내역
+            if self._panel_kind_at(e.x_root - self.root.winfo_x()) == "notify":
+                self._toggle_notifications()
+            else:
+                self._toggle_details()
             return
         self.app.cfg["bar_right"] = self.root.winfo_x() + self._fix_w
         self.app.cfg["bar_y"] = self.root.winfo_y()
@@ -1381,6 +1389,30 @@ class FloatingBar(threading.Thread):
             panels.append({"width": self._panel_width(lines), "lines": lines})
         return panels
 
+    def _notify_panel(self):
+        """루틴(예약 작업) 알림 — 안 읽은 게 없으면 패널을 아예 만들지 않는다.
+
+        `_usage_panel`과 같은 규약으로 None을 돌려주면 `_panels`가 빼고,
+        빈자리 없이 나머지 패널이 당겨진다. 그래서 평소에는 흔적이 없다가
+        새 결과가 올 때만 바에 나타난다.
+        """
+        _, unread = self.app.notifications.snapshot()
+        if not unread:
+            return None
+        accent = self.ACCENTS["notify"]
+        lines = [("알림", f"{len(unread)}건", "", accent, accent, "루틴")]
+        now = time.time()
+        for row in reversed(unread[-(self.LINES - 1):]):        # 최신부터
+            name = row["title"] or row["body"]
+            if len(name) > 22:
+                name = name[:20] + "…"
+            rel = notify_ago(row["ts"], now)
+            lines.append((name, "", f" · {rel}" if rel else "",
+                          None, None, ""))
+        while len(lines) < self.LINES:
+            lines.append(("", "", "", None, None, ""))
+        return {"width": self._panel_width(lines), "lines": lines}
+
     def _usage_panel(self):
         """예전 사용량 바의 세 줄 — 세션 / 주간(모든 모델) / 모델별."""
         rows, notice = self.app.rows, self.app.auth_notice
@@ -1414,12 +1446,38 @@ class FloatingBar(threading.Thread):
         return {"width": self._panel_width(lines), "lines": lines}
 
     def _panels(self):
-        """왼쪽부터 스킬 패널들, 맨 오른쪽(트레이 쪽)은 사용량 패널."""
-        panels = self._skill_panels()
+        """맨 왼쪽이 루틴 알림, 그다음 스킬 패널들, 맨 오른쪽이 사용량 패널.
+
+        알림을 가장 왼쪽에 두는 이유: 바는 오른쪽 끝이 앵커라 왼쪽으로 자란다.
+        알림이 맨 왼쪽이면 알림이 생기거나 사라져도 스킬·사용량 패널은 제자리에
+        그대로 있고, 바가 바깥쪽으로만 늘었다 줄었다 한다. 중간에 끼우면 알림이
+        뜰 때마다 왼쪽 패널들이 통째로 밀려서 자리가 흔들린다.
+        """
+        panels, kinds = [], []
+        notify = self._notify_panel()
+        if notify:
+            panels.append(notify)
+            kinds.append("notify")
+        skills = self._skill_panels()
+        panels.extend(skills)
+        kinds.extend(["skill"] * len(skills))
         usage = self._usage_panel()
         if usage:
             panels.append(usage)
+            kinds.append("usage")
+        # 클릭한 자리가 어느 패널인지 판정할 때 쓴다 (_panel_kind_at)
+        self._panel_kinds = kinds[:self.MAX_PANELS]
         return panels[:self.MAX_PANELS]
+
+    def _panel_kind_at(self, x):
+        """바 안의 x 좌표가 어느 패널인지 — 알림 패널만 다른 창을 연다."""
+        kinds = getattr(self, "_panel_kinds", [])
+        base = 0
+        for idx, width in enumerate(self._panel_widths):
+            if base <= x <= base + width:
+                return kinds[idx] if idx < len(kinds) else ""
+            base += width + self.PANEL_GAP
+        return ""
 
     def _label_block(self, row):
         """라벨 + 작은 꼬리표("스킬")가 차지하는 폭."""
@@ -1448,21 +1506,122 @@ class FloatingBar(threading.Thread):
     def _resize_panels(self, widths):
         if widths == self._panel_widths:
             return
-        old_w = self._fix_w
         self._panel_widths = list(widths)
         self._fix_w = sum(widths) + self.PANEL_GAP * (len(widths) - 1)
-        x, y = self.root.winfo_x(), self.root.winfo_y()
+        y = self.root.winfo_y()
         # 오른쪽 끝을 고정해 패널이 늘 때 트레이 쪽이 아니라 왼쪽으로 자란다.
-        x += old_w - self._fix_w
+        #
+        # 앵커는 설정에 저장된 bar_right가 유일한 진실이다. 예전처럼 창의 현재
+        # x에서 되계산하면(x + 폭), 기동 직후 _place_initial의 geometry가 아직
+        # 반영되지 않은 x를 읽어 앵커가 패널 폭만큼 오염된다 — 재시작 한 번에
+        # +137px씩 오른쪽으로 밀려 결국 화면 밖으로 나갔다(실측 2548→2685→2822).
+        # 여기서는 bar_right를 읽기만 하고, 쓰는 것은 사용자가 드래그로 자리를
+        # 정하는 _save_pos 한 곳뿐이다.
+        right = self.app.cfg.get("bar_right")
+        if right is None:                       # 첫 실행 — 지금 자리를 앵커로
+            right = self.root.winfo_x() + self._fix_w
+            self.app.cfg["bar_right"] = int(right)
+        x = int(right) - self._fix_w
         self.cv.configure(width=self._fix_w)
         self.root.geometry(f"{self._fix_w}x{self._fix_h}+{x}+{y}")
-        self.app.cfg["bar_right"] = x + self._fix_w
         self.app.cfg["bar_y"] = y
         save_config(self.app.cfg)
         self._bgimg = None
         self._last = [None] * (self.LINES * self.MAX_PANELS)
         self.root.update_idletasks()    # 새 geometry가 잡힌 뒤에 배경을 뜬다
         self._match_background(force=True)
+
+    def _toggle_notifications(self):
+        if self._notes is not None:
+            try:
+                if self._notes.winfo_exists():
+                    self._notes.destroy()
+                    self._notes = None
+                    return
+            except Exception:
+                pass
+            self._notes = None
+        self._open_notifications()
+
+    def _open_notifications(self):
+        """루틴이 남긴 결과 목록. 여는 순간 전부 읽음 처리 → 패널이 사라진다."""
+        import tkinter as tk
+
+        all_rows, unread = self.app.notifications.snapshot()
+        unread_from = len(all_rows) - len(unread)
+
+        win = self._notes = tk.Toplevel(self.root)
+        win.title("루틴 알림")
+        win.overrideredirect(True)
+        win.configure(bg="#f4f5f7", highlightbackground="#d9dce1",
+                      highlightthickness=1)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+
+        width, height = 560, 400
+        x = max(8, min(self.root.winfo_x() + self._fix_w - width,
+                       self.root.winfo_screenwidth() - width - 8))
+        y = max(8, self.root.winfo_y() - height - 10)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+
+        head = tk.Frame(win, bg="#ffffff", height=54)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        tk.Label(head, text="Routine Alerts", bg="#ffffff", fg="#202124",
+                 font=("Segoe UI Semibold", 14)).pack(side="left", padx=(18, 8))
+        tk.Label(head, text=f"새 알림 {len(unread)}건 · 전체 {len(all_rows)}건",
+                 bg="#ffffff", fg="#6b7280", font=("맑은 고딕", 9)
+                 ).pack(side="left", pady=(3, 0))
+        tk.Button(head, text="×", command=self._toggle_notifications,
+                  relief="flat", borderwidth=0, bg="#ffffff",
+                  activebackground="#eeeeee", fg="#6b7280",
+                  font=("Segoe UI", 15), cursor="hand2"
+                  ).pack(side="right", padx=14)
+
+        wrap = tk.Frame(win, bg="#f4f5f7")
+        wrap.pack(fill="both", expand=True, padx=18, pady=(10, 6))
+        bar = tk.Scrollbar(wrap, orient="vertical")
+        bar.pack(side="right", fill="y")
+        body = tk.Text(wrap, wrap="word", relief="flat", bg="#ffffff",
+                       fg="#30343b", font=("맑은 고딕", 9), padx=14, pady=10,
+                       cursor="arrow", yscrollcommand=bar.set,
+                       highlightbackground="#e3e6ea", highlightthickness=1)
+        bar.configure(command=body.yview)
+        body.pack(side="left", fill="both", expand=True)
+        body.tag_configure("fresh", font=("맑은 고딕", 9, "bold"),
+                           foreground="#202124")
+        body.tag_configure("title", foreground="#30343b")
+        body.tag_configure("meta", foreground="#8a9099")
+
+        if not all_rows:
+            body.insert("end", "아직 받은 루틴 알림이 없습니다.\n\n", "meta")
+            body.insert("end", "예약 작업이 결과를 남기면 여기에 쌓이고, "
+                               "안 읽은 게 있을 때만 작업표시줄에 표시됩니다.\n",
+                        "meta")
+        for row in reversed(all_rows[-100:]):       # 최신부터, 최근 100건
+            fresh = row["index"] >= unread_from
+            title = row["title"] or "(제목 없음)"
+            body.insert("end", f"{'●  ' if fresh else '　  '}{title}\n",
+                        "fresh" if fresh else "title")
+            body.insert("end", f"      {row['body']}\n", "title")
+            rel = notify_ago(row["ts"])
+            stamp = row["when"] or ""
+            body.insert("end",
+                        f"      {stamp}{'  ·  ' + rel if rel else ''}\n\n",
+                        "meta")
+        body.configure(state="disabled")
+
+        tk.Label(win, text=f"기록: {NOTIFY_LOG}", bg="#f4f5f7", fg="#8a9099",
+                 font=("맑은 고딕", 8)).pack(anchor="w", padx=18, pady=(0, 10))
+
+        win.bind("<Escape>", lambda e: self._toggle_notifications())
+        # 창에 실제로 띄운 것까지만 읽음 — 그 사이 도착한 새 알림은 남겨 둔다.
+        # 다음 틱에 바에서 패널이 사라진다(안 읽은 게 0이면 _notify_panel이 None).
+        self.app.notifications.mark_all_read(len(all_rows))
 
     def _toggle_details(self):
         if self._details is not None:
@@ -1970,6 +2129,9 @@ class FloatingBar(threading.Thread):
         if self.app.details_requested.is_set():
             self.app.details_requested.clear()
             self._toggle_details()
+        if self.app.notes_requested.is_set():
+            self.app.notes_requested.clear()
+            self._toggle_notifications()
         if not self.app.cfg.get("bar_visible", True):
             self._show(False)
             return
@@ -2128,9 +2290,13 @@ class TrayApp:
         self.icon = None
         self.cfg = load_config()
         self.skill_tracker = TrackerService()
+        self.notifications = NotificationService()
+        self.notes_requested = threading.Event()
         self.details_requested = threading.Event()
         if os.environ.get("SKILL_WIDGET_SHOW_DETAILS") == "1":
             self.details_requested.set()
+        if os.environ.get("SKILL_WIDGET_SHOW_ALERTS") == "1":
+            self.notes_requested.set()
 
         self._load_file(initial=True)   # 켜자마자 마지막 값 표시
         if not self.rows:
@@ -2495,6 +2661,8 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("스킬 사용 내역 열기",
                              lambda i, it: self.q.put(("details",))),
+            pystray.MenuItem("루틴 알림 열기",
+                             lambda i, it: self.q.put(("alerts",))),
             *upd,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
             *dbg,
@@ -2618,6 +2786,8 @@ class TrayApp:
                 self._refresh_tray()
             elif kind == "details":
                 self.details_requested.set()
+            elif kind == "alerts":
+                self.notes_requested.set()
             elif kind == "lock":
                 self.cfg["bar_locked"] = not self.cfg.get("bar_locked")
                 save_config(self.cfg)
