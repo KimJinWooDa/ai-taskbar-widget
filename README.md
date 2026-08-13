@@ -17,9 +17,12 @@ Claude Code·Codex 스킬 활동은 팝업으로 확인하는 Windows 작업표�
 - 바 맨 오른쪽(트레이 쪽)에는 Claude 사용량 패널(세션·주간·모델별 잔량)이
   항상 표시됩니다.
 - **Codex가 실행 중일 때만** 그 왼쪽에 Codex 사용량 패널이 붙습니다(일간·
-  주간 창이 기록에 있는 만큼만, 보통 주간 한 줄). Codex는 조회 API가 없어
-  세션 로그의 마지막 한도 기록을 읽으므로 Codex를 쓸 때만 갱신되고,
-  기록이 8일 넘게 없으면 빠집니다.
+  주간 창이 계정에 있는 만큼만, 보통 주간 한 줄). 값은 Codex 로그인
+  (auth.json)으로 **공식 사용량을 직접 조회**해 Codex 앱의 "남은 사용량"과
+  같은 원천입니다 — 조회가 안 되면(오프라인·토큰 만료) 세션 로그의 마지막
+  기록으로 폴백하며, 이 값은 과거 기록이라 실제와 다를 수 있습니다.
+- 표시는 Claude와 같은 **"쓴 비율"**입니다 — Codex 앱의 "남은 100%"는
+  위젯에서 0%로 보입니다.
 - 안 읽은 **루틴 알림**이 있을 때만 **맨 왼쪽**에 알림 패널이 나타납니다. 바는
   오른쪽 끝이 앵커라, 알림이 뜨고 사라져도 사용량 패널은 제자리에 있고
   바가 바깥쪽으로만 늘었다 줄어듭니다. → [루틴 알림](#루틴-알림)
@@ -112,6 +115,9 @@ powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\scheduled-tas
 - DB: `%APPDATA%\ClaudeUsageWidget\skill-usage.db`
 - 루틴 알림은 로컬 로그 파일만 읽습니다. 위젯이 그 파일을 쓰거나 지우지 않고,
   내용을 어디로도 보내지 않습니다.
+- Codex 사용량은 Codex 로그인 토큰으로 `chatgpt.com`의 공식 사용량 API만
+  읽기 조회합니다 — 다른 데이터를 보내지 않고, 토큰을 저장하거나 다른 곳으로
+  전송하지 않습니다.
 
 ## 설치
 
@@ -157,6 +163,8 @@ python -m unittest discover -s tests -v
 
 ## 참고한 구현
 
+- [CodexBar](https://github.com/steipete/CodexBar): Codex 사용량 조회 경로
+  (auth.json 토큰 → `wham/usage`)
 - [SkillsBar](https://github.com/amandeepmittal/skillsbar): Claude/Codex 스킬
   인벤토리와 호출 통계 구조
 - [claude-skills-management](https://github.com/hardness1020/claude-skills-management):

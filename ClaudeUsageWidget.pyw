@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.11.1"
+__version__ = "3.12.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -135,19 +135,71 @@ def short_reset(val):
     return reset_phrase(val).replace(" 재설정", "").replace("곧", "곧 리셋")
 
 
-# ---------------- Codex 사용량 (세션 로그의 rate limit 스냅샷)
+# ---------------- Codex 사용량
 #
-# Codex CLI는 Claude와 마찬가지로 독립 조회 API가 없고, 매 응답의
-# token_count 이벤트에 남은 한도를 실어 세션 로그(rollout-*.jsonl)에만
-# 남긴다. 그래서 값은 Codex를 실제로 쓸 때만 갱신된다 — 표시할 때
-# 스냅샷 시각을 함께 다룬다. 이 계정 로그에는 주간 창(10080분) 하나만
-# 실린다(5시간 창 없음, 2026-08-13 4,553개 이벤트 전수 확인).
-CODEX_SESS_DIR = os.path.join(HOME, ".codex", "sessions")
+# 1차 = 공식 조회(wham/usage, CodexBar와 같은 길): Codex 앱 로그인 토큰
+# (auth.json)으로 내 계정 사용량만 GET 한다. Codex 앱의 "남은 사용량"과
+# 같은 원천이라 항상 일치한다. 토큰 갱신은 Codex 몫 — 만료(401)·오프라인
+# 이면 2차 = 세션 로그(rollout-*.jsonl)의 마지막 token_count 스냅샷으로
+# 폴백한다. 폴백 값은 Codex를 실제로 쓸 때만 갱신되는 과거 기록이라,
+# 주간 창이 그 사이 리셋됐으면 실제보다 높게 보일 수 있다(2026-08-13
+# 실제로 그 어긋남 신고가 있었다 — 그래서 API가 1차다).
+CODEX_HOME_DIR = os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex"))
+CODEX_AUTH_PATH = os.path.join(CODEX_HOME_DIR, "auth.json")
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_SESS_DIR = os.path.join(CODEX_HOME_DIR, "sessions")
 CODEX_SNAP_MAX_AGE = 8 * 86400      # 주간 창이 한 바퀴 돈 스냅샷은 버린다
 CODEX_TAIL_BYTES = 512 * 1024
 CODEX_SCAN_FILES = 8
 
 _codex_cache = (None, None)         # ((최신 파일, mtime), 스냅샷)
+_codex_api_note = None              # 마지막 API 실패 사유 — 바뀔 때만 로그
+
+
+def codex_usage_api():
+    """공식 사용량 조회. 실패하면 None — 호출 쪽이 세션 로그로 폴백한다.
+
+    응답의 used_percent는 "쓴 비율"이다(0 = 방금 리셋, 100 = 한도 도달).
+    Codex 앱 사이드바는 같은 값을 "남은 %"로 뒤집어 보여준다.
+    """
+    global _codex_api_note
+    try:
+        with open(CODEX_AUTH_PATH, encoding="utf-8") as f:
+            tokens = (json.load(f).get("tokens") or {})
+        access = tokens.get("access_token")
+        if not access:
+            raise ValueError("auth.json에 access_token 없음")
+        headers = {"Authorization": f"Bearer {access}",
+                   "User-Agent": f"ai-taskbar-widget/{__version__}"}
+        if tokens.get("account_id"):
+            headers["chatgpt-account-id"] = tokens["account_id"]
+        req = urllib.request.Request(CODEX_USAGE_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception as e:                  # 조회 실패는 전부 폴백 사유
+        note = f"{type(e).__name__}"
+        if note != _codex_api_note:
+            _codex_api_note = note
+            log.info("codex usage api unavailable (%s) - falling back to "
+                     "session logs", note)
+        return None
+    rl = data.get("rate_limit") or {}
+    wins = []
+    for w in (rl.get("primary_window"), rl.get("secondary_window")):
+        if not w or w.get("used_percent") is None:
+            continue
+        secs = w.get("limit_window_seconds")
+        wins.append({"pct": float(w["used_percent"]),
+                     "resets_at": w.get("reset_at"),
+                     "minutes": secs // 60 if secs else None})
+    if not wins:
+        return None
+    wins.sort(key=lambda w: w["minutes"] or 0)
+    if _codex_api_note != "ok":
+        _codex_api_note = "ok"
+        log.info("codex usage api ok: %s",
+                 [(w["minutes"], round(w["pct"])) for w in wins])
+    return {"windows": wins, "ts": time.time()}
 
 
 def _codex_tail_snapshot(path):
@@ -2858,7 +2910,11 @@ class TrayApp:
                 log.exception("skill tracker refresh failed")
             if first or ticks % 30 == 0:    # Codex 사용량은 60초마다
                 try:
-                    self.codex_usage = codex_rate_snapshot()
+                    # 바에 패널이 뜨는 조건과 같게, 실행 중일 때만 조회한다
+                    snap = None
+                    if "codex" in self.skill_tracker.snapshot()[0]:
+                        snap = codex_usage_api()
+                    self.codex_usage = snap or codex_rate_snapshot()
                 except Exception:
                     log.exception("codex usage scan failed")
             first = False
