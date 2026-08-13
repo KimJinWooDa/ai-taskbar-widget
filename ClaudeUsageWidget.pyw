@@ -27,9 +27,9 @@ import urllib.parse
 
 from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
-                           ago as notify_ago)
+                           ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.8.0"
+__version__ = "3.8.2"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -987,6 +987,8 @@ class FloatingBar(threading.Thread):
     ADOPT_EVERY = 120       # 60초마다 소유 관계 재확인
     CAMO_MAX_AGE = 300      # 옆 픽셀이 그대로여도 이 시간이 지나면 한 번 다시 찍는다
     SIDE = 12               # 배경을 떠올 좌우 여백 폭
+    CAMO_SETTLE_MS = 180    # 폭이 바뀐 뒤 배경을 찍기까지 기다리는 시간
+    CAMO_MAX_SD = 12        # 이보다 거친 조각은 작업표시줄이 아니다(글자·아이콘)
     BG = "#1f1f1f"          # 첫 픽셀 샘플링 전까지의 임시 배경
     PAL_DARK = {"label": "#a6a6a6", "value": "#dcdcdc", "time": "#7a7a7a"}
     PAL_LIGHT = {"label": "#5f5f5f", "value": "#1f1f1f", "time": "#909090"}
@@ -1039,6 +1041,7 @@ class FloatingBar(threading.Thread):
         self._hide_pending_log = False  # 훅이 숨겼다 — 판단 근거는 틱이 남긴다
         self._sunk_log_at = 0.0     # "가라앉음" 로그 최근 시각 (5초 간격 제한)
         self._camo_at = 0.0
+        self._camo_retry = 0        # 거친 조각을 만나 다시 노린 횟수 (상한 5)
         self._pal = self.PAL_DARK
         self._bgimg = None
         self._probe_warned = False
@@ -1243,7 +1246,7 @@ class FloatingBar(threading.Thread):
             self._pending = None
         self._rgb = rgb
         try:
-            from PIL import Image, ImageGrab, ImageTk
+            from PIL import Image, ImageGrab, ImageStat, ImageTk
             x, y = self.root.winfo_x(), self.root.winfo_y()
             w, h, s = self._fix_w, self._fix_h, self.SIDE
             x0 = max(x - s, 0)
@@ -1253,9 +1256,36 @@ class FloatingBar(threading.Thread):
                 return
             shot = ImageGrab.grab(bbox=(x0, y, x1, y + h),
                                   all_screens=True).convert("RGB")
-            left = (shot.crop((0, 0, lw, h)).resize((w, h)) if lw > 0 else None)
-            right = (shot.crop((shot.width - rw, 0, shot.width, h))
-                     .resize((w, h)) if rw > 0 else None)
+
+            def strip(box):
+                """작업표시줄 빈 구간만 배경으로 쓴다.
+
+                바가 방금 비운 자리는 작업표시줄이 아직 다시 그리기 전이라,
+                거기엔 우리 글자가 그대로 남아 있다. 그걸 떠서 가로로 늘이면
+                배경에 글자가 구워져 화면이 깨진 것처럼 보인다(사용자 신고).
+                빈 구간은 매끈하므로, 거친 조각은 버리고 다음 기회에 다시 찍는다.
+                """
+                part = shot.crop(box)
+                if max(ImageStat.Stat(part).stddev or [0]) > self.CAMO_MAX_SD:
+                    return None
+                return part.resize((w, h))
+
+            left = strip((0, 0, lw, h)) if lw > 0 else None
+            right = (strip((shot.width - rw, 0, shot.width, h))
+                     if rw > 0 else None)
+            if left is None and right is None:
+                # 양쪽 다 못 믿을 조각 — 쓰던 배경을 그대로 두고 다시 시도한다.
+                # 폭이 막 바뀐 참이면(force) 남은 배경은 폭이 안 맞으니 곧바로
+                # 다시 노린다. 몇 번 해도 안 되면 정기 확인에 맡긴다.
+                self._rgb = None
+                if force and self._camo_retry < 5:
+                    self._camo_retry += 1
+                    self.root.after(self.CAMO_SETTLE_MS,
+                                    lambda: self._match_background(force=True))
+                log.info("camo skipped: both strips look busy (retry %d)",
+                         self._camo_retry)
+                return
+            self._camo_retry = 0
             if left is None:
                 img = right
             elif right is None:
@@ -1362,12 +1392,23 @@ class FloatingBar(threading.Thread):
         self._match_background(force=True)  # 옮긴 자리의 배경으로 다시 위장
 
     def _hide_click(self, e):
+        # 알림 패널 위에서의 우클릭은 "확인했다" — 목록을 열지 않고 그 자리에서
+        # 읽음 처리하고, 다음 틱에 패널이 사라진다. 창을 여닫는 수고 없이 끄는
+        # 길이 없어서 알림이 계속 남아 있다는 신고가 있었다.
+        if self._panel_kind_at(e.x_root - self.root.winfo_x()) == "notify":
+            self.app.notifications.mark_all_read()
+            log.info("alerts marked read (right-click)")
+            return
         self.app.cfg["bar_visible"] = False
         save_config(self.app.cfg)
         self._show(False)
 
     def _skill_panels(self):
-        """실행 중인 앱별 스킬 요약 패널. 줄 = (라벨, 값, 시간, 라벨색, 값색)."""
+        """실행 중인 앱별 스킬 요약 패널 — [(클라이언트, 패널)].
+
+        클라이언트를 함께 돌려주는 이유는 `_panels`가 Claude 것끼리 붙여
+        놓기 위해서다. 줄 = (라벨, 값, 시간, 라벨색, 값색, 꼬리표).
+        """
         clients, summaries, _ = self.app.skill_tracker.snapshot()
         panels = []
         for client in clients:
@@ -1386,7 +1427,8 @@ class FloatingBar(threading.Thread):
             while len(lines) < self.LINES:
                 lines.append(("실행 기록 없음" if len(lines) == 1 else "",
                               "", "", None, None, ""))
-            panels.append({"width": self._panel_width(lines), "lines": lines})
+            panels.append(
+                (client, {"width": self._panel_width(lines), "lines": lines}))
         return panels
 
     def _notify_panel(self):
@@ -1446,21 +1488,30 @@ class FloatingBar(threading.Thread):
         return {"width": self._panel_width(lines), "lines": lines}
 
     def _panels(self):
-        """맨 왼쪽이 루틴 알림, 그다음 스킬 패널들, 맨 오른쪽이 사용량 패널.
+        """왼쪽부터 Codex · 루틴 알림 · Claude 스킬 · Claude 사용량.
 
-        알림을 가장 왼쪽에 두는 이유: 바는 오른쪽 끝이 앵커라 왼쪽으로 자란다.
-        알림이 맨 왼쪽이면 알림이 생기거나 사라져도 스킬·사용량 패널은 제자리에
-        그대로 있고, 바가 바깥쪽으로만 늘었다 줄었다 한다. 중간에 끼우면 알림이
-        뜰 때마다 왼쪽 패널들이 통째로 밀려서 자리가 흔들린다.
+        Claude 것(알림·스킬·사용량)을 한 덩어리로 붙이고 Codex를 바깥으로
+        뺀다 — 예전 순서(알림·Claude·Codex·사용량)는 Codex가 Claude 패널
+        사이에 끼어 읽기 어려웠다.
+
+        바는 오른쪽 끝이 앵커라 왼쪽으로 자라므로, 자주 나타났다 사라지는
+        패널일수록 왼쪽에 둔다. 알림이 생기거나 사라질 때 밀리는 것은 이제
+        가장 왼쪽의 Codex뿐이고, Claude 세 패널은 제자리를 지킨다.
         """
         panels, kinds = [], []
+        skills = self._skill_panels()
+        for client, panel in skills:        # Codex(그 밖의 앱)는 맨 왼쪽
+            if client != "claude":
+                panels.append(panel)
+                kinds.append("skill")
         notify = self._notify_panel()
         if notify:
             panels.append(notify)
             kinds.append("notify")
-        skills = self._skill_panels()
-        panels.extend(skills)
-        kinds.extend(["skill"] * len(skills))
+        for client, panel in skills:        # 여기부터 오른쪽 끝까지 Claude
+            if client == "claude":
+                panels.append(panel)
+                kinds.append("skill")
         usage = self._usage_panel()
         if usage:
             panels.append(usage)
@@ -1526,10 +1577,13 @@ class FloatingBar(threading.Thread):
         self.root.geometry(f"{self._fix_w}x{self._fix_h}+{x}+{y}")
         self.app.cfg["bar_y"] = y
         save_config(self.app.cfg)
-        self._bgimg = None
         self._last = [None] * (self.LINES * self.MAX_PANELS)
         self.root.update_idletasks()    # 새 geometry가 잡힌 뒤에 배경을 뜬다
-        self._match_background(force=True)
+        # 곧바로 찍지 않는다 — 바가 방금 비운 자리를 작업표시줄이 다시 그리기
+        # 전이라 우리 글자가 남아 있고, 그걸 배경으로 구우면 화면이 깨져 보인다.
+        # 쓰던 배경은 지우지 않고 두므로 그 사이 검은 사각형이 뜨지도 않는다.
+        self.root.after(self.CAMO_SETTLE_MS,
+                        lambda: self._match_background(force=True))
 
     def _toggle_notifications(self):
         if self._notes is not None:
@@ -1610,9 +1664,19 @@ class FloatingBar(threading.Thread):
             body.insert("end", f"      {row['body']}\n", "title")
             rel = notify_ago(row["ts"])
             stamp = row["when"] or ""
-            body.insert("end",
-                        f"      {stamp}{'  ·  ' + rel if rel else ''}\n\n",
+            body.insert("end", f"      {stamp}{'  ·  ' + rel if rel else ''}",
                         "meta")
+            # 루틴이 "이걸 실행하면 된다"를 알려준 알림에만 버튼이 붙는다.
+            # 없거나 파일이 사라졌으면 아무것도 안 붙는다(대부분의 알림).
+            target = notify_run_target(row)
+            if target is not None:
+                body.insert("end", "   ", "meta")
+                body.window_create("end", window=tk.Button(
+                    body, text="실행", relief="flat", borderwidth=0,
+                    bg="#e8f0fe", activebackground="#d7e5fd", fg="#1a56c4",
+                    font=("맑은 고딕", 8), cursor="hand2", padx=8,
+                    command=lambda p=target: self._run_alert_target(p)))
+            body.insert("end", "\n\n", "meta")
         body.configure(state="disabled")
 
         tk.Label(win, text=f"기록: {NOTIFY_LOG}", bg="#f4f5f7", fg="#8a9099",
@@ -1622,6 +1686,29 @@ class FloatingBar(threading.Thread):
         # 창에 실제로 띄운 것까지만 읽음 — 그 사이 도착한 새 알림은 남겨 둔다.
         # 다음 틱에 바에서 패널이 사라진다(안 읽은 게 0이면 _notify_panel이 None).
         self.app.notifications.mark_all_read(len(all_rows))
+
+    def _run_alert_target(self, path):
+        """알림이 가리킨 것을 연다 — 탐색기에서 더블클릭한 것과 같다.
+
+        묻고 나서 연다: 로그는 평문이라 이 계정으로 쓸 수 있는 것이면 무엇이든
+        한 줄 붙일 수 있으니, 무엇이 열리는지 전체 경로를 보여주고 사용자가
+        승인할 때만 실행한다. 명령줄은 아예 받지 않는다(`run_target` 참고).
+        """
+        from tkinter import messagebox
+
+        if not messagebox.askokcancel(
+                "루틴 알림 — 실행",
+                f"아래 항목을 실행할까요?\n\n{path}",
+                parent=self._notes):
+            return
+        try:
+            os.startfile(str(path))         # 셸 기본 동작 = 더블클릭
+            log.info("alert target launched: %s", path)
+        except OSError as e:
+            log.error("alert target failed: %s (%s)", path, e)
+            messagebox.showerror("루틴 알림 — 실행 실패",
+                                 f"열지 못했습니다.\n\n{path}\n\n{e}",
+                                 parent=self._notes)
 
     def _toggle_details(self):
         if self._details is not None:

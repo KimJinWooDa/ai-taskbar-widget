@@ -11,6 +11,7 @@
 #
 # 로그 형식 — 위젯이 읽는 계약이다:
 #   [yyyy-MM-dd HH:mm:ss] 제목 | 본문
+#   [yyyy-MM-dd HH:mm:ss] 제목 | 본문 |run:C:\경로\할것.bat   (-Run 을 준 경우)
 #   제목에는 파이프(|)를 쓰지 않는다. 본문에는 써도 된다.
 #   기본 위치: %USERPROFILE%\.claude\scheduled-tasks\notifications.log
 #   (CLAUDE_NOTIFY_LOG 환경변수로 옮길 수 있다. 위젯도 같은 변수를 본다.)
@@ -20,7 +21,11 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$Title,
-    [Parameter(Mandatory = $true)][string]$Message
+    [Parameter(Mandatory = $true)][string]$Message,
+    # 사람이 뭔가 실행해야 끝나는 알림이면 그 대상의 전체 경로를 넘긴다.
+    # 그러면 위젯의 알림 목록에 [실행] 버튼이 붙는다. 위젯은 '있는 절대경로'만
+    # 인정하고 확인을 받은 뒤 탐색기처럼 열 뿐이라, 명령줄은 넘길 수 없다.
+    [string]$Run
 )
 
 $ErrorActionPreference = 'Continue'
@@ -39,6 +44,21 @@ $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 $Title = ($Title -replace '[\r\n]+', ' ').Trim() -replace '\|', '/'
 $Message = ($Message -replace '[\r\n]+', ' ').Trim()
 
+# 실행 대상은 맨 끝에 "|run:<경로>"로 붙인다. 경로에는 파이프를 못 쓰므로
+# 본문에 파이프가 섞여도 경계가 안 흔들린다.
+$runSuffix = ''
+if ($Run) {
+    $runPath = ($Run -replace '[\r\n|]+', ' ').Trim().Trim('"')
+    if ($runPath) {
+        if (-not (Test-Path -LiteralPath $runPath)) {
+            # 막지는 않는다 — 알림이 온 뒤에 만들어지는 파일도 있다. 다만
+            # 위젯은 실행 시점에 없으면 버튼을 안 보여주므로 알려는 준다.
+            Write-Output "RUN_TARGET_MISSING: $runPath"
+        }
+        $runSuffix = " |run:$runPath"
+    }
+}
+
 # 로그가 무한정 자라지 않게 한다. 위젯은 파일이 바뀔 때마다 전체를 다시 읽으므로
 # 길이가 곧 읽기 비용이다. 평상시 알림 빈도로는 몇 년을 써도 안 걸리는 한도지만,
 # 고빈도 루틴을 붙인 사용자에게도 상한이 있어야 한다.
@@ -51,7 +71,7 @@ try {
     if ($dir -and -not (Test-Path $dir)) {
         New-Item -ItemType Directory -Force $dir | Out-Null
     }
-    Add-Content -Path $logPath -Value "[$stamp] $Title | $Message" -Encoding UTF8
+    Add-Content -Path $logPath -Value "[$stamp] $Title | $Message$runSuffix" -Encoding UTF8
 
     $lines = @(Get-Content -LiteralPath $logPath -Encoding UTF8)
     if ($lines.Count -gt $MaxLines) {

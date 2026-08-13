@@ -36,6 +36,10 @@ STATE_PATH = Path(os.environ.get("CLAUDE_NOTIFY_STATE",
 # "[2026-07-31 17:40:51] 제목 | 본문" — 제목에는 파이프를 쓰지 않는다.
 _LINE_RE = re.compile(
     r"^\[(?P<when>[^\]]+)\]\s*(?P<title>[^|]*?)\s*\|\s*(?P<body>.*)$")
+# 선택 꼬리표 "|run:<경로>" — 루틴이 "이걸 실행하면 된다"를 명시할 때만 붙인다.
+# 맨 끝에서만 찾고 파이프를 안 넘는다: Windows 경로에는 파이프를 못 쓰므로
+# 본문에 파이프가 섞여 있어도 경계가 흔들리지 않는다.
+_RUN_RE = re.compile(r"\s*\|\s*run:\s*(?P<run>[^|]+?)\s*$")
 _WHEN_FMT = "%Y-%m-%d %H:%M:%S"
 
 
@@ -46,12 +50,37 @@ def _parse(line: str, index: int) -> dict:
         when, title, body = m["when"], m["title"], m["body"]
     else:
         when, title, body = "", "", line
+    run = ""
+    rm = _RUN_RE.search(body)
+    if rm:
+        run = rm["run"]
+        body = body[:rm.start()].rstrip()
     try:
         ts = time.mktime(time.strptime(when, _WHEN_FMT))
     except (ValueError, OverflowError):
         ts = 0.0
     return {"index": index, "when": when, "ts": ts,
-            "title": title, "body": body}
+            "title": title, "body": body, "run": run}
+
+
+def run_target(row: dict) -> Path | None:
+    """알림이 가리키는 '열 것'. 없거나 못 믿을 값이면 None.
+
+    로그는 평문이라 이 프로세스로 쓸 수 있는 것이면 무엇이든 한 줄 붙일 수
+    있다. 그래서 여기서는 **명령줄을 절대 받지 않는다** — 디스크에 실제로
+    있는 절대경로 하나만 인정하고, 실행은 탐색기 더블클릭과 같은 방식으로
+    한다. 인자·파이프·리다이렉션이 낄 자리가 없다.
+    """
+    raw = (row.get("run") or "").strip().strip('"')
+    if not raw:
+        return None
+    try:
+        path = Path(os.path.expandvars(raw))
+        if not path.is_absolute() or not path.exists():
+            return None            # 상대경로는 기준이 모호, 없는 것은 못 연다
+    except (OSError, ValueError):
+        return None
+    return path
 
 
 def entries() -> list[dict]:
