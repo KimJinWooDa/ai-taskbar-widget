@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.12.0"
+__version__ = "3.13.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -351,8 +351,10 @@ def translate_ko(text):
 
 
 def load_config():
+    # utf-8-sig: PowerShell류 외부 도구가 BOM을 붙여 저장하면 json.load가
+    # 터져 설정 전체(위치·토글)가 기본값으로 날아간다 — 실측된 실패 경로.
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
@@ -1447,11 +1449,19 @@ class FloatingBar(threading.Thread):
             log.exception("bg capture failed")
 
     def _value_color(self, pct):
+        """pct는 항상 '쓴 비율' — 표시 모드와 무관하게 위험색 기준은 같다."""
         if pct >= 90:
             return "#da3633"
         if pct >= 70:
             return "#bb8009"
         return self._pal["value"]
+
+    def _disp_pct(self, pct):
+        """표시용 값 — 기본은 쓴 비율(0에서 시작), 트레이 메뉴의 "남은
+        비율로 표시"를 켜면 100에서 깎이는 값이 된다."""
+        if self.app.cfg.get("usage_remaining"):
+            return max(0.0, 100.0 - pct)
+        return pct
 
     def _apply_lock(self):
         """잠금이면 클릭 통과(WS_EX_TRANSPARENT), 아니면 해제.
@@ -1591,7 +1601,8 @@ class FloatingBar(threading.Thread):
             if resets and now >= resets:
                 return (label, "—", " · 리셋 지남", lcolor, accent, "")
             t = short_reset(resets)
-            return (label, f"{round(win['pct'])}%", f" · {t}" if t else "",
+            return (label, f"{round(self._disp_pct(win['pct']))}%",
+                    f" · {t}" if t else "",
                     lcolor, self._value_color(win["pct"]), "")
 
         # 이틀 미만 창(일간류)만 앱명 줄에, 그 이상은 "주간" 줄로
@@ -1631,7 +1642,7 @@ class FloatingBar(threading.Thread):
             elif row:
                 pct, reset = row
                 t = short_reset(reset)
-                lines.append((title, f"{round(pct)}%",
+                lines.append((title, f"{round(self._disp_pct(pct))}%",
                               f" · {t}" if t else "",
                               self.ACCENTS["claude"] if idx == 0 else None,
                               self._value_color(pct), ""))
@@ -2928,7 +2939,9 @@ class TrayApp:
         if self.rows:
             for label, pct, reset in self.rows:
                 phrase = reset_phrase(reset)
-                text = f"{label}   {round(pct)}%"
+                shown = (100 - pct if self.cfg.get("usage_remaining")
+                         else pct)
+                text = f"{label}   {round(shown)}%"
                 if phrase:
                     text += f"   ·  {phrase}"
                 items.append(pystray.MenuItem(text, None, enabled=False))
@@ -2979,6 +2992,10 @@ class TrayApp:
             pystray.MenuItem("바 위치 잠금 (클릭 통과)",
                              lambda i, it: self.q.put(("lock",)),
                              checked=lambda it: bool(self.cfg.get("bar_locked"))),
+            pystray.MenuItem("사용량을 남은 비율로 표시",
+                             lambda i, it: self.q.put(("remaining",)),
+                             checked=lambda it: bool(
+                                 self.cfg.get("usage_remaining"))),
             pystray.MenuItem("Windows 시작 시 자동 실행",
                              lambda i, it: self.q.put(("startup",)),
                              checked=lambda it: startup_installed()),
@@ -3095,6 +3112,11 @@ class TrayApp:
                 self.notes_requested.set()
             elif kind == "lock":
                 self.cfg["bar_locked"] = not self.cfg.get("bar_locked")
+                save_config(self.cfg)
+                self._refresh_tray()
+            elif kind == "remaining":
+                self.cfg["usage_remaining"] = not self.cfg.get(
+                    "usage_remaining")
                 save_config(self.cfg)
                 self._refresh_tray()
             elif kind == "startup":
