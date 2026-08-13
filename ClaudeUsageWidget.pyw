@@ -29,7 +29,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.8.2"
+__version__ = "3.9.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -975,7 +975,7 @@ class FloatingBar(threading.Thread):
     """
 
     LINES = 3               # 작업표시줄 48px에 12px 줄 3개 + 여백 6px
-    MAX_PANELS = 4          # Claude 스킬 + Codex 스킬 + 루틴 알림 + 사용량
+    MAX_PANELS = 2          # 루틴 알림 + 사용량
     PANEL_GAP = 20
     ACCENTS = {"claude": "#d97757", "codex": "#45a79a", "notify": "#c58a1a"}
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
@@ -1403,34 +1403,6 @@ class FloatingBar(threading.Thread):
         save_config(self.app.cfg)
         self._show(False)
 
-    def _skill_panels(self):
-        """실행 중인 앱별 스킬 요약 패널 — [(클라이언트, 패널)].
-
-        클라이언트를 함께 돌려주는 이유는 `_panels`가 Claude 것끼리 붙여
-        놓기 위해서다. 줄 = (라벨, 값, 시간, 라벨색, 값색, 꼬리표).
-        """
-        clients, summaries, _ = self.app.skill_tracker.snapshot()
-        panels = []
-        for client in clients:
-            data = summaries.get(client) or {}
-            title = "Claude" if client == "claude" else "Codex"
-            accent = self.ACCENTS.get(client)
-            # 작은 "스킬" 꼬리표 — 사용량 패널의 "Claude 22%"와 안 헷갈리게
-            lines = [(title, f"{data.get('installed', 0)}개", "",
-                      accent, accent, "스킬")]
-            for row in data.get("top", [])[:2]:
-                name = row["name"]
-                if len(name) > 22:
-                    name = name[:20] + "…"
-                lines.append((name, f"{row['total_count']}회", "",
-                              None, None, ""))
-            while len(lines) < self.LINES:
-                lines.append(("실행 기록 없음" if len(lines) == 1 else "",
-                              "", "", None, None, ""))
-            panels.append(
-                (client, {"width": self._panel_width(lines), "lines": lines}))
-        return panels
-
     def _notify_panel(self):
         """루틴(예약 작업) 알림 — 안 읽은 게 없으면 패널을 아예 만들지 않는다.
 
@@ -1488,30 +1460,17 @@ class FloatingBar(threading.Thread):
         return {"width": self._panel_width(lines), "lines": lines}
 
     def _panels(self):
-        """왼쪽부터 Codex · 루틴 알림 · Claude 스킬 · Claude 사용량.
+        """왼쪽부터 루틴 알림 · 사용량. 스킬 확인은 바가 아니라 스킬 내역
+        창에서 한다(바 클릭 또는 트레이 메뉴).
 
-        Claude 것(알림·스킬·사용량)을 한 덩어리로 붙이고 Codex를 바깥으로
-        뺀다 — 예전 순서(알림·Claude·Codex·사용량)는 Codex가 Claude 패널
-        사이에 끼어 읽기 어려웠다.
-
-        바는 오른쪽 끝이 앵커라 왼쪽으로 자라므로, 자주 나타났다 사라지는
-        패널일수록 왼쪽에 둔다. 알림이 생기거나 사라질 때 밀리는 것은 이제
-        가장 왼쪽의 Codex뿐이고, Claude 세 패널은 제자리를 지킨다.
+        바는 오른쪽 끝이 앵커라 왼쪽으로 자라므로, 나타났다 사라지는 알림을
+        왼쪽에 둬 사용량 패널이 제자리를 지킨다.
         """
         panels, kinds = [], []
-        skills = self._skill_panels()
-        for client, panel in skills:        # Codex(그 밖의 앱)는 맨 왼쪽
-            if client != "claude":
-                panels.append(panel)
-                kinds.append("skill")
         notify = self._notify_panel()
         if notify:
             panels.append(notify)
             kinds.append("notify")
-        for client, panel in skills:        # 여기부터 오른쪽 끝까지 Claude
-            if client == "claude":
-                panels.append(panel)
-                kinds.append("skill")
         usage = self._usage_panel()
         if usage:
             panels.append(usage)
@@ -1531,7 +1490,7 @@ class FloatingBar(threading.Thread):
         return ""
 
     def _label_block(self, row):
-        """라벨 + 작은 꼬리표("스킬")가 차지하는 폭."""
+        """라벨 + 작은 꼬리표("루틴")가 차지하는 폭."""
         w = self._font.measure(row[0])
         if len(row) > 5 and row[5]:
             w += self._font_small.measure(row[5]) + 4
