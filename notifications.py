@@ -112,19 +112,24 @@ def ago(ts: float, now: float | None = None) -> str:
     return f"{secs // 86400}일 전"
 
 
-def _load_read_count() -> int:
+def _load_counts() -> tuple[int, int]:
+    """(읽은 개수, 지운 개수). 지운 것은 읽은 것보다 클 수 없다."""
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        return max(0, int(data.get("read_count", 0)))
+        read = max(0, int(data.get("read_count", 0)))
+        cleared = max(0, int(data.get("cleared_count", 0)))
+        return max(read, cleared), cleared
     except (OSError, ValueError, TypeError, AttributeError):
-        return 0
+        return 0, 0
 
 
-def _save_read_count(n: int) -> None:
+def _save_counts(read: int, cleared: int) -> None:
     try:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
-        tmp.write_text(json.dumps({"read_count": int(n)}), encoding="utf-8")
+        tmp.write_text(json.dumps({"read_count": int(read),
+                                   "cleared_count": int(cleared)}),
+                       encoding="utf-8")
         os.replace(tmp, STATE_PATH)     # 원자적 교체 — 중간에 죽어도 안 깨진다
     except OSError:
         pass                            # 읽음 표시를 못 남겨도 위젯은 계속 돈다
@@ -143,7 +148,7 @@ class NotificationService:
         self._lock = threading.Lock()
         self._entries: list[dict] = []
         self._stamp: tuple[float, int] | None = None
-        self._read_count = _load_read_count()
+        self._read_count, self._cleared = _load_counts()
 
     def refresh(self, force: bool = False) -> None:
         try:
@@ -158,14 +163,15 @@ class NotificationService:
         with self._lock:
             self._stamp = stamp
             self._entries = rows
-            if self._read_count > len(rows):
+            if self._read_count > len(rows) or self._cleared > len(rows):
                 # 로그를 지웠거나 갈아치웠다 — 남은 것은 다 읽은 것으로 본다.
-                self._read_count = len(rows)
-                keep = self._read_count
+                self._read_count = min(self._read_count, len(rows))
+                self._cleared = min(self._cleared, len(rows))
+                keep = (self._read_count, self._cleared)
             else:
                 keep = None
         if keep is not None:
-            _save_read_count(keep)
+            _save_counts(*keep)
 
     def snapshot(self) -> tuple[list[dict], list[dict]]:
         """(전체, 안 읽은 것). 둘 다 오래된 것부터."""
@@ -188,4 +194,25 @@ class NotificationService:
             if n <= self._read_count:
                 return                  # 읽음 표시는 뒤로 물러나지 않는다
             self._read_count = n
-        _save_read_count(n)
+            counts = (self._read_count, self._cleared)
+        _save_counts(*counts)
+
+    def cleared_count(self) -> int:
+        """'모두 지우기'로 목록에서 숨긴 항목 수 — 이 인덱스부터 보여준다."""
+        with self._lock:
+            return self._cleared
+
+    def clear_all(self) -> None:
+        """창의 '모두 지우기'. 로그 파일은 루틴의 기록이라 건드리지 않고
+        (이 모듈은 읽기 전용), 지금까지의 항목을 목록에서 숨기기만 한다.
+        이후에 오는 알림은 평소처럼 쌓인다.
+        """
+        self.refresh()
+        with self._lock:
+            n = len(self._entries)
+            if n <= self._cleared:
+                return
+            self._cleared = n
+            self._read_count = max(self._read_count, n)
+            counts = (self._read_count, self._cleared)
+        _save_counts(*counts)

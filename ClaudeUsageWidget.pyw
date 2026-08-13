@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.10.1"
+__version__ = "3.11.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -171,15 +171,18 @@ def _codex_tail_snapshot(path):
                 if w and w.get("used_percent") is not None]
         if not wins:
             continue        # limit_id=premium 등 창이 비어 오는 이벤트도 있다
-        # 둘 다 실려 오면 긴 창(주간)을 쓴다
-        win = max(wins, key=lambda w: w.get("window_minutes") or 0)
+        # 짧은 창(일간류)이 먼저 — 바에서 Claude처럼 첫 줄이 짧은 창이 된다
+        wins.sort(key=lambda w: w.get("window_minutes") or 0)
         try:
             ts = datetime.datetime.fromisoformat(
                 obj["timestamp"].replace("Z", "+00:00")).timestamp()
         except (KeyError, ValueError):
             ts = os.path.getmtime(path)
-        return {"pct": float(win["used_percent"]),
-                "resets_at": win.get("resets_at"), "ts": ts}
+        return {"windows": [{"pct": float(w["used_percent"]),
+                             "resets_at": w.get("resets_at"),
+                             "minutes": w.get("window_minutes")}
+                            for w in wins],
+                "ts": ts}
     return None
 
 
@@ -213,10 +216,9 @@ def codex_rate_snapshot():
         if snap:
             break
     _codex_cache = (newest, snap)
-    if snap and (prev is None or (prev["pct"], prev["resets_at"])
-                 != (snap["pct"], snap["resets_at"])):
-        log.info("codex usage snapshot: %.0f%% resets_at=%s (ts %s)",
-                 snap["pct"], snap["resets_at"],
+    if snap and (prev is None or prev["windows"] != snap["windows"]):
+        log.info("codex usage snapshot: %s (ts %s)",
+                 [(w["minutes"], round(w["pct"])) for w in snap["windows"]],
                  time.strftime("%m-%d %H:%M", time.localtime(snap["ts"])))
     return snap
 
@@ -1515,29 +1517,40 @@ class FloatingBar(threading.Thread):
         return {"width": self._panel_width(lines), "lines": lines}
 
     def _codex_panel(self):
-        """Codex 주간 사용량 — 세션 로그의 마지막 스냅샷.
+        """Codex 사용량 — Claude 패널과 똑같은 꼴.
 
-        Codex를 쓸 때만 갱신되는 값이라, 5분 넘게 오래된 값에는 기준
-        시각을 달고, 리셋 시각이 지난 값은 지어내지 않고 '리셋 지남'으로
-        둔다(남은 시간은 resets_at에서 매번 계산하므로 그때까지는 정확).
+        첫 줄은 앱명(Codex, 앱색) 줄로 Claude의 세션처럼 짧은 창(일간류)이
+        붙고, "주간"은 Claude처럼 제 줄에 기본색 라벨로 내려간다. 짧은
+        창이 기록에 없으면(이 계정이 그렇다) 첫 줄은 앱명만 남는다.
+        리셋 지난 값은 지어내지 않고 '리셋 지남'으로 둔다.
         """
         snap = self.app.codex_usage
-        if not snap:
+        if not snap or not snap.get("windows"):
+            return None
+        # 실행 중인 앱만 바에 올린다 — 다른 패널들과 같은 규칙. 스냅샷
+        # 수집은 계속 돌므로 Codex를 켜면 그 자리에서 바로 나타난다.
+        if "codex" not in self.app.skill_tracker.snapshot()[0]:
             return None
         accent = self.ACCENTS["codex"]
         now = time.time()
-        resets = snap.get("resets_at")
-        if resets and now >= resets:
-            lines = [("Codex", "—", "", accent, accent, "주간"),
-                     ("리셋 지남 · 쓰면 갱신", "", "", None, None, "")]
-        else:
+
+        def row(label, win, lcolor):
+            resets = win.get("resets_at")
+            if resets and now >= resets:
+                return (label, "—", " · 리셋 지남", lcolor, accent, "")
             t = short_reset(resets)
-            lines = [("Codex", f"{round(snap['pct'])}%",
-                      f" · {t}" if t else "",
-                      accent, self._value_color(snap["pct"]), "주간")]
-            if now - snap["ts"] > 300:
-                lines.append((f"{notify_ago(snap['ts'], now)} 기준",
-                              "", "", None, None, ""))
+            return (label, f"{round(win['pct'])}%", f" · {t}" if t else "",
+                    lcolor, self._value_color(win["pct"]), "")
+
+        # 이틀 미만 창(일간류)만 앱명 줄에, 그 이상은 "주간" 줄로
+        short = [w for w in snap["windows"] if (w.get("minutes") or 0) < 2880]
+        week = [w for w in snap["windows"] if (w.get("minutes") or 0) >= 2880]
+        if short:
+            lines = [row("Codex", short[0], accent)]
+        else:
+            lines = [("Codex", "", "", accent, accent, "")]
+        for win in week[:self.LINES - 1]:
+            lines.append(row("주간", win, None))
         while len(lines) < self.LINES:
             lines.append(("", "", "", None, None, ""))
         return {"width": self._panel_width(lines), "lines": lines}
@@ -1677,10 +1690,16 @@ class FloatingBar(threading.Thread):
         self._open_notifications()
 
     def _open_notifications(self):
-        """루틴이 남긴 결과 목록. 여는 순간 전부 읽음 처리 → 패널이 사라진다."""
+        """루틴이 남긴 결과 목록. 여는 순간 전부 읽음 처리 → 패널이 사라진다.
+
+        항목은 카드형 — 안 읽은 것은 노란 틴트, 제목 줄 오른쪽에 상대
+        시각, 아래 본문, 바닥에 기록 시각과 (있으면) 실행 버튼. '모두
+        지우기'는 로그 파일이 아니라 위젯의 표시 상태만 지운다.
+        """
         import tkinter as tk
 
         all_rows, unread = self.app.notifications.snapshot()
+        rows = all_rows[self.app.notifications.cleared_count():]
         unread_from = len(all_rows) - len(unread)
 
         win = self._notes = tk.Toplevel(self.root)
@@ -1695,7 +1714,7 @@ class FloatingBar(threading.Thread):
         except tk.TclError:
             pass
 
-        width, height = 560, 400
+        width, height = 560, 440
         x = max(8, min(self.root.winfo_x() + self._fix_w - width,
                        self.root.winfo_screenwidth() - width - 8))
         y = max(8, self.root.winfo_y() - height - 10)
@@ -1706,57 +1725,85 @@ class FloatingBar(threading.Thread):
         head.pack_propagate(False)
         tk.Label(head, text="Routine Alerts", bg="#ffffff", fg="#202124",
                  font=("Segoe UI Semibold", 14)).pack(side="left", padx=(18, 8))
-        tk.Label(head, text=f"새 알림 {len(unread)}건 · 전체 {len(all_rows)}건",
+        tk.Label(head, text=f"새 알림 {len(unread)}건 · 전체 {len(rows)}건",
                  bg="#ffffff", fg="#6b7280", font=("맑은 고딕", 9)
                  ).pack(side="left", pady=(3, 0))
         tk.Button(head, text="×", command=self._toggle_notifications,
                   relief="flat", borderwidth=0, bg="#ffffff",
                   activebackground="#eeeeee", fg="#6b7280",
                   font=("Segoe UI", 15), cursor="hand2"
-                  ).pack(side="right", padx=14)
+                  ).pack(side="right", padx=(0, 14))
+        if rows:
+            tk.Button(head, text="모두 지우기", command=self._clear_alerts,
+                      relief="flat", borderwidth=0, bg="#f4f5f7",
+                      activebackground="#e9ebee", fg="#6b7280",
+                      font=("맑은 고딕", 8), cursor="hand2", padx=10
+                      ).pack(side="right", padx=(0, 10), pady=13)
 
         wrap = tk.Frame(win, bg="#f4f5f7")
         wrap.pack(fill="both", expand=True, padx=18, pady=(10, 6))
         bar = tk.Scrollbar(wrap, orient="vertical")
         bar.pack(side="right", fill="y")
-        body = tk.Text(wrap, wrap="word", relief="flat", bg="#ffffff",
-                       fg="#30343b", font=("맑은 고딕", 9), padx=14, pady=10,
-                       cursor="arrow", yscrollcommand=bar.set,
-                       highlightbackground="#e3e6ea", highlightthickness=1)
-        bar.configure(command=body.yview)
-        body.pack(side="left", fill="both", expand=True)
-        body.tag_configure("fresh", font=("맑은 고딕", 9, "bold"),
-                           foreground="#202124")
-        body.tag_configure("title", foreground="#30343b")
-        body.tag_configure("meta", foreground="#8a9099")
+        cv = tk.Canvas(wrap, bg="#f4f5f7", highlightthickness=0,
+                       yscrollcommand=bar.set)
+        cv.pack(side="left", fill="both", expand=True)
+        bar.configure(command=cv.yview)
+        card_w = width - 2 * 18 - 18            # 좌우 여백 + 스크롤바 자리
+        inner = tk.Frame(cv, bg="#f4f5f7")
+        cv.create_window((0, 0), window=inner, anchor="nw", width=card_w)
+        inner.bind("<Configure>",
+                   lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        # 카드 안 어디서 굴려도 목록이 굴러가게 전역으로 잡고, 닫힐 때 푼다
+        win.bind_all("<MouseWheel>", lambda e: cv.yview_scroll(
+            -1 if e.delta > 0 else 1, "units"))
+        win.bind("<Destroy>", lambda e: (
+            win.unbind_all("<MouseWheel>") if e.widget is win else None))
 
-        if not all_rows:
-            body.insert("end", "아직 받은 루틴 알림이 없습니다.\n\n", "meta")
-            body.insert("end", "예약 작업이 결과를 남기면 여기에 쌓이고, "
-                               "안 읽은 게 있을 때만 작업표시줄에 표시됩니다.\n",
-                        "meta")
-        for row in reversed(all_rows[-100:]):       # 최신부터, 최근 100건
+        if not rows:
+            tk.Label(inner, text="알림이 없습니다.", bg="#f4f5f7",
+                     fg="#8a9099", font=("맑은 고딕", 9)
+                     ).pack(anchor="w", pady=(6, 2))
+            tk.Label(inner, text="예약 작업이 결과를 남기면 여기에 쌓이고, "
+                                 "안 읽은 게 있을 때만 작업표시줄에 표시됩니다.",
+                     bg="#f4f5f7", fg="#8a9099", font=("맑은 고딕", 9),
+                     wraplength=card_w - 8, justify="left").pack(anchor="w")
+        for row in reversed(rows[-100:]):       # 최신부터, 최근 100건
             fresh = row["index"] >= unread_from
-            title = row["title"] or "(제목 없음)"
-            body.insert("end", f"{'●  ' if fresh else '　  '}{title}\n",
-                        "fresh" if fresh else "title")
-            body.insert("end", f"      {row['body']}\n", "title")
+            bg = "#fff7e6" if fresh else "#ffffff"
+            edge = "#ecd9ac" if fresh else "#e3e6ea"
+            card = tk.Frame(inner, bg=bg, highlightbackground=edge,
+                            highlightthickness=1)
+            card.pack(fill="x", pady=(0, 8))
+            top = tk.Frame(card, bg=bg)
+            top.pack(fill="x", padx=12, pady=(8, 0))
+            if fresh:
+                tk.Label(top, text="●", bg=bg, fg=self.ACCENTS["notify"],
+                         font=("맑은 고딕", 8)).pack(side="left", padx=(0, 6))
+            tk.Label(top, text=row["title"] or "(제목 없음)", bg=bg,
+                     fg="#202124", font=("맑은 고딕", 9, "bold")
+                     ).pack(side="left")
             rel = notify_ago(row["ts"])
-            stamp = row["when"] or ""
-            body.insert("end", f"      {stamp}{'  ·  ' + rel if rel else ''}",
-                        "meta")
+            if rel:
+                tk.Label(top, text=rel, bg=bg, fg="#8a9099",
+                         font=("맑은 고딕", 8)).pack(side="right")
+            if row["body"]:
+                tk.Label(card, text=row["body"], bg=bg, fg="#4b5158",
+                         font=("맑은 고딕", 9), wraplength=card_w - 26,
+                         justify="left").pack(anchor="w", padx=12, pady=(2, 0))
+            foot = tk.Frame(card, bg=bg)
+            foot.pack(fill="x", padx=12, pady=(3, 8))
+            tk.Label(foot, text=row["when"] or "", bg=bg, fg="#a3a9b1",
+                     font=("맑은 고딕", 8)).pack(side="left")
             # 루틴이 "이걸 실행하면 된다"를 알려준 알림에만 버튼이 붙는다.
             # 없거나 파일이 사라졌으면 아무것도 안 붙는다(대부분의 알림).
             target = notify_run_target(row)
             if target is not None:
-                body.insert("end", "   ", "meta")
-                body.window_create("end", window=tk.Button(
-                    body, text="실행", relief="flat", borderwidth=0,
-                    bg="#e8f0fe", activebackground="#d7e5fd", fg="#1a56c4",
-                    font=("맑은 고딕", 8), cursor="hand2", padx=8,
-                    command=lambda p=target: self._run_alert_target(p)))
-            body.insert("end", "\n\n", "meta")
-        body.configure(state="disabled")
+                tk.Button(foot, text="실행", relief="flat", borderwidth=0,
+                          bg="#e8f0fe", activebackground="#d7e5fd",
+                          fg="#1a56c4", font=("맑은 고딕", 8), cursor="hand2",
+                          padx=10,
+                          command=lambda p=target: self._run_alert_target(p)
+                          ).pack(side="right")
 
         tk.Label(win, text=f"기록: {NOTIFY_LOG}", bg="#f4f5f7", fg="#8a9099",
                  font=("맑은 고딕", 8)).pack(anchor="w", padx=18, pady=(0, 10))
@@ -1765,6 +1812,29 @@ class FloatingBar(threading.Thread):
         # 창에 실제로 띄운 것까지만 읽음 — 그 사이 도착한 새 알림은 남겨 둔다.
         # 다음 틱에 바에서 패널이 사라진다(안 읽은 게 0이면 _notify_panel이 None).
         self.app.notifications.mark_all_read(len(all_rows))
+
+    def _clear_alerts(self):
+        """알림 창의 '모두 지우기' — 확인 후 목록을 비우고 창을 새로 그린다."""
+        from tkinter import messagebox
+
+        all_rows, _ = self.app.notifications.snapshot()
+        n = len(all_rows) - self.app.notifications.cleared_count()
+        if not n:
+            return
+        if not messagebox.askyesno(
+                "모두 지우기",
+                f"알림 {n}건을 목록에서 지울까요?\n"
+                f"루틴 기록 파일은 그대로 남습니다.", parent=self._notes):
+            return
+        self.app.notifications.clear_all()
+        log.info("alerts cleared (%d rows hidden)", n)
+        if self._notes is not None:
+            try:
+                self._notes.destroy()
+            except Exception:
+                pass
+            self._notes = None
+        self._open_notifications()
 
     def _run_alert_target(self, path):
         """알림이 가리킨 것을 연다 — 탐색기에서 더블클릭한 것과 같다.
