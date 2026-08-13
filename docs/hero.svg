@@ -1,0 +1,93 @@
+<svg width="880" height="310" viewBox="0 0 880 310" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI Taskbar Widget — Claude와 Codex 사용량, 루틴 알림을 작업표시줄 한 줄로">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="880" y2="310" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#211d1a"/>
+      <stop offset="1" stop-color="#141110"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(160 20) scale(320)">
+      <stop offset="0" stop-color="#d97757" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#d97757" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(730 300) scale(300)">
+      <stop offset="0" stop-color="#45a79a" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#45a79a" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="card">
+      <rect x="0" y="0" width="880" height="310" rx="18"/>
+    </clipPath>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="5" stdDeviation="10" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#card)">
+    <rect x="0" y="0" width="880" height="310" fill="url(#bg)"/>
+    <rect x="0" y="0" width="880" height="310" fill="url(#glowA)"/>
+    <rect x="0" y="0" width="880" height="310" fill="url(#glowB)"/>
+  </g>
+  <rect x="0.5" y="0.5" width="879" height="309" rx="17.5" stroke="#ffffff" stroke-opacity="0.09"/>
+
+  <g font-family="-apple-system, 'Segoe UI', 'Malgun Gothic', 'Apple SD Gothic Neo', Roboto, sans-serif">
+    <!-- 상단 필 -->
+    <rect x="325" y="40" width="230" height="26" rx="13" fill="#ffffff" fill-opacity="0.04" stroke="#ffffff" stroke-opacity="0.16"/>
+    <text x="440" y="57" text-anchor="middle" font-size="11" letter-spacing="2.5" fill="#b5aca2">WINDOWS TASKBAR WIDGET</text>
+
+    <!-- 타이틀 -->
+    <text x="440" y="112" text-anchor="middle" font-size="44" font-weight="800">
+      <tspan fill="#d97757">AI</tspan><tspan fill="#f3eee7"> Taskbar Widget</tspan>
+    </text>
+    <text x="440" y="147" text-anchor="middle" font-size="15" fill="#a39a90">Claude · Codex 사용량과 루틴 알림은 작업표시줄 한 줄로, 스킬 활동은 팝업으로</text>
+
+    <!-- 바 목업 -->
+    <g transform="translate(-44 0)">
+      <!-- 패널 라벨 -->
+      <text x="235" y="181" text-anchor="middle" font-size="11" font-weight="600" fill="#c58a1a">루틴 알림 · 안 읽은 것만</text>
+      <text x="420" y="181" text-anchor="middle" font-size="11" font-weight="600" fill="#45a79a">Codex · 실행 중일 때만</text>
+      <text x="618" y="181" text-anchor="middle" font-size="11" font-weight="600" fill="#d97757">Claude · 항상 표시</text>
+      <line x1="235" y1="187" x2="235" y2="199" stroke="#c58a1a" stroke-opacity="0.55"/>
+      <line x1="420" y1="187" x2="420" y2="199" stroke="#45a79a" stroke-opacity="0.55"/>
+      <line x1="618" y1="187" x2="618" y2="199" stroke="#d97757" stroke-opacity="0.55"/>
+
+      <!-- 작업표시줄 스트립 -->
+      <rect x="178" y="203" width="612" height="52" rx="10" fill="#1f1f1f" stroke="#ffffff" stroke-opacity="0.10" filter="url(#soft)"/>
+
+      <!-- 루틴 알림 패널 -->
+      <rect x="190" y="211" width="3" height="36" rx="1.5" fill="#c58a1a"/>
+      <text x="202" y="223" font-size="10" font-weight="600" fill="#c58a1a">루틴</text>
+      <text x="202" y="241" font-size="12">
+        <tspan fill="#a6a6a6">새 알림 </tspan><tspan fill="#e8e4de" font-weight="600">2건</tspan>
+      </text>
+
+      <line x1="316" y1="213" x2="316" y2="245" stroke="#ffffff" stroke-opacity="0.08"/>
+
+      <!-- Codex 패널 -->
+      <rect x="336" y="211" width="3" height="36" rx="1.5" fill="#45a79a"/>
+      <text x="348" y="223" font-size="10" font-weight="600" fill="#45a79a">Codex</text>
+      <text x="348" y="241" font-size="12">
+        <tspan fill="#a6a6a6">주간 </tspan><tspan fill="#2ea043" font-weight="600">41%</tspan><tspan fill="#7a7a7a"> · 2일 4시간 후</tspan>
+      </text>
+
+      <line x1="522" y1="213" x2="522" y2="245" stroke="#ffffff" stroke-opacity="0.08"/>
+
+      <!-- Claude 패널 -->
+      <rect x="542" y="209" width="3" height="40" rx="1.5" fill="#d97757"/>
+      <text x="553" y="218" font-size="11.5">
+        <tspan fill="#d97757">Claude </tspan><tspan fill="#bb8009" font-weight="600">64%</tspan><tspan fill="#7a7a7a"> · 4시간 19분 후</tspan>
+      </text>
+      <text x="553" y="232" font-size="11.5">
+        <tspan fill="#a6a6a6">주간 </tspan><tspan fill="#2ea043" font-weight="600">32%</tspan><tspan fill="#7a7a7a"> · 6일 9시간 후</tspan>
+      </text>
+      <text x="553" y="246" font-size="11.5">
+        <tspan fill="#a6a6a6">Fable </tspan><tspan fill="#da3633" font-weight="600">82%</tspan><tspan fill="#7a7a7a"> · 6일 9시간 후</tspan>
+      </text>
+
+      <line x1="706" y1="213" x2="706" y2="245" stroke="#ffffff" stroke-opacity="0.08"/>
+
+      <!-- 시계 -->
+      <text x="774" y="224" text-anchor="end" font-size="12" fill="#dcdcdc">오후 9:30</text>
+      <text x="774" y="241" text-anchor="end" font-size="10.5" fill="#8b857d">2026-08-13</text>
+    </g>
+
+    <text x="440" y="285" text-anchor="middle" font-size="10.5" fill="#6d665f">표시값은 예시입니다 · 글자색은 작업표시줄 밝기에 맞춰 자동 전환됩니다</text>
+  </g>
+</svg>
