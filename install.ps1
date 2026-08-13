@@ -97,16 +97,23 @@ function Add-SkillHook {
 Add-SkillHook -EventName "PreToolUse" -Matcher "^Skill$"
 Add-SkillHook -EventName "UserPromptExpansion" -Matcher ""
 
-# Claude 세션이 시작되면 위젯도 켠다 — 이미 떠 있으면 기존 인스턴스에
-# 신호만 보내고 끝난다(단일 인스턴스). cmd start로 분리 실행해 훅은 즉시 끝난다.
-$startCommand = 'cmd /c start "" "' + ($widget -replace '\\', '/') + '"'
+# Claude 세션이 시작되면 위젯도 켠다 — 이미 떠 있으면 예약 작업이 무시되고
+# 조용히 끝난다(exit 0). 훅에서 EXE를 직접 실행하면 Claude 데스크톱(MSIX)
+# 컨테이너 신원을 상속받아 %APPDATA% 쓰기가 패키지 그림자로 격리되므로
+# (알림 읽음 상태 분열 사고), 위에서 등록한 예약 작업을 경유해 띄운다.
+$startCommand = 'schtasks /run /tn "AI Taskbar Widget"'
 $startGroups = @()
 $startProp = $settings.hooks.PSObject.Properties["SessionStart"]
 if ($startProp) { $startGroups = @($startProp.Value) }
 $startExists = $false
 foreach ($group in $startGroups) {
     foreach ($handler in @($group.hooks)) {
-        if ($handler.command -like "*AI-Skill-Widget.exe*") { $startExists = $true }
+        if ($handler.command -like "*AI Taskbar Widget*") { $startExists = $true }
+        elseif ($handler.command -like "*AI-Skill-Widget.exe*") {
+            # 구버전 훅(EXE 직접 실행)은 새 명령으로 교체한다 — 중복 방지
+            $handler.command = $startCommand
+            $startExists = $true
+        }
     }
 }
 if (-not $startExists) {
@@ -140,7 +147,8 @@ else {
 }
 
 Write-Host "[5/5] 실행"
-Start-Process -FilePath $widget
+# 직접 실행 대신 예약 작업 경유 — 훅과 같은 이유(사용자 신원 보장).
+Start-ScheduledTask -TaskName "AI Taskbar Widget"
 
 Write-Host ""
 Write-Host "설치 완료. 이후 별도 명령 없이 자동 추적됩니다." -ForegroundColor Green
