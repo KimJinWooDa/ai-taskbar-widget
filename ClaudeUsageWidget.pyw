@@ -11,6 +11,7 @@ Claude 사용량 트레이 아이콘 v2 — 시계 옆에 사용률(%)을 항상
 """
 import ctypes
 import ctypes.wintypes
+import glob
 import json
 import os
 import re
@@ -29,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.9.0"
+__version__ = "3.10.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -132,6 +133,92 @@ def reset_phrase(val):
 def short_reset(val):
     """플로팅 바용 짧은 표기: '3시간 59분 후' / '곧 리셋'."""
     return reset_phrase(val).replace(" 재설정", "").replace("곧", "곧 리셋")
+
+
+# ---------------- Codex 사용량 (세션 로그의 rate limit 스냅샷)
+#
+# Codex CLI는 Claude와 마찬가지로 독립 조회 API가 없고, 매 응답의
+# token_count 이벤트에 남은 한도를 실어 세션 로그(rollout-*.jsonl)에만
+# 남긴다. 그래서 값은 Codex를 실제로 쓸 때만 갱신된다 — 표시할 때
+# 스냅샷 시각을 함께 다룬다. 이 계정 로그에는 주간 창(10080분) 하나만
+# 실린다(5시간 창 없음, 2026-08-13 4,553개 이벤트 전수 확인).
+CODEX_SESS_DIR = os.path.join(HOME, ".codex", "sessions")
+CODEX_SNAP_MAX_AGE = 8 * 86400      # 주간 창이 한 바퀴 돈 스냅샷은 버린다
+CODEX_TAIL_BYTES = 512 * 1024
+CODEX_SCAN_FILES = 8
+
+_codex_cache = (None, None)         # ((최신 파일, mtime), 스냅샷)
+
+
+def _codex_tail_snapshot(path):
+    """파일 꼬리에서 창(used_percent)이 실린 마지막 스냅샷을 찾는다."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - CODEX_TAIL_BYTES))
+            data = f.read()
+    except OSError:
+        return None
+    for raw in reversed(data.splitlines()):
+        if b'"rate_limits"' not in raw:
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        rl = (obj.get("payload") or {}).get("rate_limits") or {}
+        wins = [w for w in (rl.get("primary"), rl.get("secondary"))
+                if w and w.get("used_percent") is not None]
+        if not wins:
+            continue        # limit_id=premium 등 창이 비어 오는 이벤트도 있다
+        # 둘 다 실려 오면 긴 창(주간)을 쓴다
+        win = max(wins, key=lambda w: w.get("window_minutes") or 0)
+        try:
+            ts = datetime.datetime.fromisoformat(
+                obj["timestamp"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError):
+            ts = os.path.getmtime(path)
+        return {"pct": float(win["used_percent"]),
+                "resets_at": win.get("resets_at"), "ts": ts}
+    return None
+
+
+def codex_rate_snapshot():
+    """최근 Codex 세션의 마지막 한도 스냅샷 — 없으면 None.
+
+    최신 파일부터 꼬리만 읽는다(활성 세션 파일은 90MB를 넘기도 한다).
+    마지막 쓰기가 있었던 파일이 mtime 최신이 되므로, 최신 파일과 그
+    mtime이 그대로면 지난 결과를 그대로 쓴다.
+    """
+    global _codex_cache
+    now = time.time()
+    try:
+        paths = sorted(
+            glob.glob(os.path.join(CODEX_SESS_DIR, "**", "*.jsonl"),
+                      recursive=True),
+            key=os.path.getmtime, reverse=True)[:CODEX_SCAN_FILES]
+        paths = [p for p in paths
+                 if now - os.path.getmtime(p) < CODEX_SNAP_MAX_AGE]
+        if not paths:
+            return None
+        newest = (paths[0], os.path.getmtime(paths[0]))
+    except OSError:
+        return None
+    if _codex_cache[0] == newest:
+        return _codex_cache[1]
+    prev = _codex_cache[1]
+    snap = None
+    for path in paths:
+        snap = _codex_tail_snapshot(path)
+        if snap:
+            break
+    _codex_cache = (newest, snap)
+    if snap and (prev is None or (prev["pct"], prev["resets_at"])
+                 != (snap["pct"], snap["resets_at"])):
+        log.info("codex usage snapshot: %.0f%% resets_at=%s (ts %s)",
+                 snap["pct"], snap["resets_at"],
+                 time.strftime("%m-%d %H:%M", time.localtime(snap["ts"])))
+    return snap
 
 
 # 로컬 SKILL.md가 없는 내장 스킬들의 기본 설명 (한국어로 미리 조사해 내장)
@@ -975,7 +1062,7 @@ class FloatingBar(threading.Thread):
     """
 
     LINES = 3               # 작업표시줄 48px에 12px 줄 3개 + 여백 6px
-    MAX_PANELS = 2          # 루틴 알림 + 사용량
+    MAX_PANELS = 3          # 루틴 알림 + Codex 사용량 + Claude 사용량
     PANEL_GAP = 20
     ACCENTS = {"claude": "#d97757", "codex": "#45a79a", "notify": "#c58a1a"}
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
@@ -1427,6 +1514,34 @@ class FloatingBar(threading.Thread):
             lines.append(("", "", "", None, None, ""))
         return {"width": self._panel_width(lines), "lines": lines}
 
+    def _codex_panel(self):
+        """Codex 주간 사용량 — 세션 로그의 마지막 스냅샷.
+
+        Codex를 쓸 때만 갱신되는 값이라, 5분 넘게 오래된 값에는 기준
+        시각을 달고, 리셋 시각이 지난 값은 지어내지 않고 '리셋 지남'으로
+        둔다(남은 시간은 resets_at에서 매번 계산하므로 그때까지는 정확).
+        """
+        snap = self.app.codex_usage
+        if not snap:
+            return None
+        accent = self.ACCENTS["codex"]
+        now = time.time()
+        resets = snap.get("resets_at")
+        if resets and now >= resets:
+            lines = [("Codex", "—", "", accent, accent, "주간"),
+                     ("리셋 지남 · 쓰면 갱신", "", "", None, None, "")]
+        else:
+            t = short_reset(resets)
+            lines = [("Codex", f"{round(snap['pct'])}%",
+                      f" · {t}" if t else "",
+                      accent, self._value_color(snap["pct"]), "주간")]
+            if now - snap["ts"] > 300:
+                lines.append((f"{notify_ago(snap['ts'], now)} 기준",
+                              "", "", None, None, ""))
+        while len(lines) < self.LINES:
+            lines.append(("", "", "", None, None, ""))
+        return {"width": self._panel_width(lines), "lines": lines}
+
     def _usage_panel(self):
         """예전 사용량 바의 세 줄 — 세션 / 주간(모든 모델) / 모델별."""
         rows, notice = self.app.rows, self.app.auth_notice
@@ -1460,17 +1575,22 @@ class FloatingBar(threading.Thread):
         return {"width": self._panel_width(lines), "lines": lines}
 
     def _panels(self):
-        """왼쪽부터 루틴 알림 · 사용량. 스킬 확인은 바가 아니라 스킬 내역
-        창에서 한다(바 클릭 또는 트레이 메뉴).
+        """왼쪽부터 루틴 알림 · Codex 사용량 · Claude 사용량. 스킬 확인은
+        바가 아니라 스킬 내역 창에서 한다(바 클릭 또는 트레이 메뉴).
 
-        바는 오른쪽 끝이 앵커라 왼쪽으로 자라므로, 나타났다 사라지는 알림을
-        왼쪽에 둬 사용량 패널이 제자리를 지킨다.
+        바는 오른쪽 끝이 앵커라 왼쪽으로 자라므로, 자주 나타났다 사라지는
+        패널일수록 왼쪽에 둔다 — 알림이 가장 잦고, Codex는 기록이 8일
+        넘게 없을 때만 빠진다.
         """
         panels, kinds = [], []
         notify = self._notify_panel()
         if notify:
             panels.append(notify)
             kinds.append("notify")
+        codex = self._codex_panel()
+        if codex:
+            panels.append(codex)
+            kinds.append("usage")
         usage = self._usage_panel()
         if usage:
             panels.append(usage)
@@ -2336,6 +2456,7 @@ class TrayApp:
         self.icon = None
         self.cfg = load_config()
         self.skill_tracker = TrackerService()
+        self.codex_usage = None         # 워커가 쓰고 Tk 틱이 읽는다
         self.notifications = NotificationService()
         self.notes_requested = threading.Event()
         self.details_requested = threading.Event()
@@ -2659,12 +2780,19 @@ class TrayApp:
 
     def _skill_loop(self):
         first = True
+        ticks = 0
         while not self.stop_evt.is_set():
             try:
                 self.skill_tracker.refresh(force=first)
-                first = False
             except Exception:
                 log.exception("skill tracker refresh failed")
+            if first or ticks % 30 == 0:    # Codex 사용량은 60초마다
+                try:
+                    self.codex_usage = codex_rate_snapshot()
+                except Exception:
+                    log.exception("codex usage scan failed")
+            first = False
+            ticks += 1
             self.stop_evt.wait(2)
 
     # ---------------- 트레이
@@ -2702,6 +2830,8 @@ class TrayApp:
         if self.update_info:
             upd = [pystray.MenuItem(f"새 버전 v{self.update_info[0]} 설치…",
                                     lambda i, it: self.q.put(("update",)))]
+        # 유형별로 실선 구분: 사용량 정보 / 창 열기 / 동작 / 설정 토글 /
+        # 이력·진단 / 종료 — 한 덩어리로 붙어 있어 찾기 어렵다는 신고가 있었다
         return pystray.Menu(
             *self._menu_lines(),
             pystray.Menu.SEPARATOR,
@@ -2709,12 +2839,14 @@ class TrayApp:
                              lambda i, it: self.q.put(("details",))),
             pystray.MenuItem("루틴 알림 열기",
                              lambda i, it: self.q.put(("alerts",))),
+            pystray.Menu.SEPARATOR,
             *upd,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
             *dbg,
             pystray.MenuItem("장수 토큰 등록 (클립보드에서)",
                              lambda i, it: self.q.put(("token",)),
                              checked=lambda it: bool(self.cfg.get("setup_token"))),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("플로팅 바 표시",
                              lambda i, it: self.q.put(("bar",)),
                              checked=lambda it: self.cfg.get("bar_visible", True)),
@@ -2724,6 +2856,7 @@ class TrayApp:
             pystray.MenuItem("Windows 시작 시 자동 실행",
                              lambda i, it: self.q.put(("startup",)),
                              checked=lambda it: startup_installed()),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("패치 이력 보기", lambda i, it: self.q.put(("notes",))),
             pystray.MenuItem("로그 폴더 열기", lambda i, it: self.q.put(("log",))),
             pystray.Menu.SEPARATOR,
