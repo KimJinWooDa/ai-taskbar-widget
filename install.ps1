@@ -17,12 +17,37 @@ $hook = Join-Path $installDir "SkillEventHook.exe"
 $startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
 $startupVbs = Join-Path $startupDir "AI-Skill-Widget.vbs"
 
+# 실행 중이던 EXE는 프로세스가 끝난 뒤에도 파일 핸들이 잠깐 남아, 첫 복사가
+# "다른 프로세스가 사용 중" 으로 실패한다(실측). 짧게 재시도해서 넘긴다.
+function Copy-FileWithRetry {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Copy-Item $Source $Destination -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            if ($attempt -eq 5) { throw }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+}
+
 Write-Host "[1/5] 앱 설치 -> $installDir"
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Get-Process -Name "AI-Skill-Widget" -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
-Copy-Item $widgetSource $widget -Force
-Copy-Item $hookSource $hook -Force
+# 인스턴스가 여러 개면 전부 빠질 때까지 기다린다. 타임아웃은 조용히 넘기고
+# 남은 잠금은 아래 재시도 복사에 맡긴다.
+Wait-Process -Name "AI-Skill-Widget" -Timeout 10 -ErrorAction SilentlyContinue
+# 훅 EXE는 실행 중인 훅이 잡고 있을 수 있다. 카운터 기록이 깨지지 않게
+# 죽이지 않고 스스로 끝나기를 기다린다(훅 타임아웃 3초).
+Wait-Process -Name "SkillEventHook" -Timeout 10 -ErrorAction SilentlyContinue
+Copy-FileWithRetry $widgetSource $widget
+Copy-FileWithRetry $hookSource $hook
 
 Write-Host "[2/5] Windows 시작 프로그램 등록 (로그온 예약 작업)"
 # 시작프로그램 폴더는 Windows가 수십 초 늦게 실행한다(실측 44초) —
