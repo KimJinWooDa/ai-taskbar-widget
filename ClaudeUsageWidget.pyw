@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.13.1"
+__version__ = "3.14.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -151,9 +151,11 @@ CODEX_SESS_DIR = os.path.join(CODEX_HOME_DIR, "sessions")
 CODEX_SNAP_MAX_AGE = 8 * 86400      # 주간 창이 한 바퀴 돈 스냅샷은 버린다
 CODEX_TAIL_BYTES = 512 * 1024
 CODEX_SCAN_FILES = 8
+CODEX_TAIL_EVENTS = 40              # 창을 다 못 찾았을 때 거슬러 볼 이벤트 수
 
 _codex_cache = (None, None)         # ((최신 파일, mtime), 스냅샷)
 _codex_api_note = None              # 마지막 API 실패 사유 — 바뀔 때만 로그
+_codex_last = None                  # 창 길이별로 살아 있는 마지막 값
 
 
 def codex_usage_api():
@@ -203,7 +205,15 @@ def codex_usage_api():
 
 
 def _codex_tail_snapshot(path):
-    """파일 꼬리에서 창(used_percent)이 실린 마지막 스냅샷을 찾는다."""
+    """파일 꼬리에서 창(used_percent)이 실린 마지막 스냅샷을 찾는다.
+
+    한 이벤트에 5시간 창이 빠지고 주간 창만 실려 오는 경우가 있다
+    (secondary=null, primary=주간). 그 이벤트 하나만 보면 바에서 5시간
+    줄이 통째로 사라지므로, 창 길이별로 "가장 최근 값"을 모으며 조금 더
+    거슬러 올라간다. 리셋 시각이 이미 지난 창은 지금 값이 아니라서 줍지
+    않지만, 그렇게 해서 아무것도 안 남으면 예전처럼 마지막 이벤트를
+    그대로 돌려준다(패널이 통째로 사라지지 않게).
+    """
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
@@ -211,6 +221,8 @@ def _codex_tail_snapshot(path):
             data = f.read()
     except OSError:
         return None
+    now = time.time()
+    found, newest, ts, seen = {}, None, None, 0
     for raw in reversed(data.splitlines()):
         if b'"rate_limits"' not in raw:
             continue
@@ -219,23 +231,34 @@ def _codex_tail_snapshot(path):
         except ValueError:
             continue
         rl = (obj.get("payload") or {}).get("rate_limits") or {}
-        wins = [w for w in (rl.get("primary"), rl.get("secondary"))
+        wins = [{"pct": float(w["used_percent"]),
+                 "resets_at": w.get("resets_at"),
+                 "minutes": w.get("window_minutes")}
+                for w in (rl.get("primary"), rl.get("secondary"))
                 if w and w.get("used_percent") is not None]
         if not wins:
             continue        # limit_id=premium 등 창이 비어 오는 이벤트도 있다
-        # 짧은 창(일간류)이 먼저 — 바에서 Claude처럼 첫 줄이 짧은 창이 된다
-        wins.sort(key=lambda w: w.get("window_minutes") or 0)
-        try:
-            ts = datetime.datetime.fromisoformat(
-                obj["timestamp"].replace("Z", "+00:00")).timestamp()
-        except (KeyError, ValueError):
-            ts = os.path.getmtime(path)
-        return {"windows": [{"pct": float(w["used_percent"]),
-                             "resets_at": w.get("resets_at"),
-                             "minutes": w.get("window_minutes")}
-                            for w in wins],
-                "ts": ts}
-    return None
+        if ts is None:
+            newest = wins
+            try:
+                ts = datetime.datetime.fromisoformat(
+                    obj["timestamp"].replace("Z", "+00:00")).timestamp()
+            except (KeyError, ValueError):
+                ts = os.path.getmtime(path)
+        for w in wins:
+            resets = w["resets_at"]
+            if w["minutes"] in found or (resets and now >= resets):
+                continue    # 더 최근 값이 이미 있거나, 이미 리셋된 창이다
+            found[w["minutes"]] = w
+        seen += 1
+        if len(found) >= 2 or seen >= CODEX_TAIL_EVENTS:
+            break
+    wins = list(found.values()) or newest
+    if not wins:
+        return None
+    # 짧은 창(일간류)이 먼저 — 바에서 Claude처럼 첫 줄이 짧은 창이 된다
+    return {"windows": sorted(wins, key=lambda w: w["minutes"] or 0),
+            "ts": ts}
 
 
 def codex_rate_snapshot():
@@ -273,6 +296,35 @@ def codex_rate_snapshot():
                  [(w["minutes"], round(w["pct"])) for w in snap["windows"]],
                  time.strftime("%m-%d %H:%M", time.localtime(snap["ts"])))
     return snap
+
+
+def codex_merge(snap):
+    """새로 읽은 값에서 빠진 창을 직전 값으로 메운다 — 없으면 None.
+
+    Codex는 5시간 창이 통째로 빠지고 주간 창만 실려 오는 응답을 종종
+    돌려준다(secondary=null). 그때마다 바에서 5시간 줄이 사라졌다가
+    다음 조회에 되돌아와, 사용자 눈에는 "주간만 나온다"로 보였다
+    (2026-08-26 신고). 창 길이를 키로 직전 값을 이어 붙이되 리셋 시각이
+    지난 창은 버려, 이미 리셋된 옛 값을 되살리지는 않는다.
+    """
+    global _codex_last
+    now = time.time()
+    wins, seen = [], set()
+    for w in (snap or {}).get("windows", []):
+        wins.append(w)
+        seen.add(w.get("minutes"))
+    for w in (_codex_last or {}).get("windows", []):
+        m, resets = w.get("minutes"), w.get("resets_at")
+        if m is None or m in seen or not resets or now >= resets:
+            continue
+        wins.append(w)
+        seen.add(m)
+    if not wins:
+        _codex_last = None
+        return None
+    wins.sort(key=lambda w: w.get("minutes") or 0)
+    _codex_last = {"windows": wins, "ts": (snap or _codex_last)["ts"]}
+    return _codex_last
 
 
 # 로컬 SKILL.md가 없는 내장 스킬들의 기본 설명 (한국어로 미리 조사해 내장)
@@ -1583,8 +1635,12 @@ class FloatingBar(threading.Thread):
 
         첫 줄은 앱명(Codex, 앱색) 줄로 Claude의 세션처럼 짧은 창(일간류)이
         붙고, "주간"은 Claude처럼 제 줄에 기본색 라벨로 내려간다. 짧은
-        창이 기록에 없으면(이 계정이 그렇다) 첫 줄은 앱명만 남는다.
+        창이 기록에 없으면 첫 줄은 앱명만 남는다.
         리셋 지난 값은 지어내지 않고 '리셋 지남'으로 둔다.
+
+        앱명 옆에 창 길이 꼬리표("Codex 5시간")를 붙이지 않는다 — Claude
+        패널 첫 줄이 라벨 없는 "Claude"라서 규격이 어긋난다(2026-08-26
+        사용자 지시).
         """
         snap = self.app.codex_usage
         if not snap or not snap.get("windows"):
@@ -2869,7 +2925,7 @@ class TrayApp:
                               or "리프레시 토큰" in api_denied_reason
                               or "인증" in api_denied_reason):
                             # 리프레시 체인까지 끊긴 상태 — 재로그인만이 답
-                            n = "재로그인 필요 · claude /login"
+                            n = "재로그인 필요 · 트레이 메뉴 클릭"
                             if n != self.auth_notice:
                                 self.auth_notice = n
                                 log.info("auth notice: %s", n)
@@ -2900,7 +2956,7 @@ class TrayApp:
                     elif api_denied_reason and ("토큰 갱신" in api_denied_reason
                                                 or "리프레시 토큰" in api_denied_reason
                                                 or "인증" in api_denied_reason):
-                        st = "재로그인 필요 — 터미널에서 claude /login"
+                        st = "재로그인 필요 — 메뉴에서 '재로그인' 클릭"
                     elif api_denied_reason:
                         st = "대기 중 — 훅 설정 확인 필요"
                     else:
@@ -2925,7 +2981,8 @@ class TrayApp:
                     snap = None
                     if "codex" in self.skill_tracker.snapshot()[0]:
                         snap = codex_usage_api()
-                    self.codex_usage = snap or codex_rate_snapshot()
+                    self.codex_usage = codex_merge(snap
+                                                   or codex_rate_snapshot())
                 except Exception:
                     log.exception("codex usage scan failed")
             first = False
@@ -2969,6 +3026,11 @@ class TrayApp:
         if self.update_info:
             upd = [pystray.MenuItem(f"새 버전 v{self.update_info[0]} 설치…",
                                     lambda i, it: self.q.put(("update",)))]
+        # 재로그인은 인증이 끊겼을 때만 — 평소엔 눌러도 할 일이 없는 항목이다
+        auth = []
+        if self.auth_notice:
+            auth = [pystray.MenuItem("재로그인 (터미널 열기)",
+                                     lambda i, it: self.q.put(("relogin",)))]
         # 유형별로 실선 구분: 사용량 정보 / 창 열기 / 동작 / 설정 토글 /
         # 이력·진단 / 종료 — 한 덩어리로 붙어 있어 찾기 어렵다는 신고가 있었다
         return pystray.Menu(
@@ -2979,6 +3041,7 @@ class TrayApp:
             pystray.MenuItem("루틴 알림 열기",
                              lambda i, it: self.q.put(("alerts",))),
             pystray.Menu.SEPARATOR,
+            *auth,
             *upd,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
             *dbg,
@@ -3005,6 +3068,27 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("종료", lambda i, it: self.q.put(("quit",))),
         )
+
+    def _open_login_terminal(self):
+        """새 콘솔 창에서 claude 로그인을 띄운다 — 인증은 브라우저로 이어진다."""
+        import shutil
+        import subprocess
+        exe = shutil.which("claude") or os.path.join(
+            os.environ.get("APPDATA", HOME), "npm", "claude.cmd")
+        if not os.path.exists(exe):
+            exe = "claude"              # PATH에 있기를 기대하고 이름만 넘긴다
+        try:
+            # /k 로 창을 남긴다 — 실패해도 사용자가 오류를 읽을 수 있게.
+            # 바깥 따옴표 한 겹은 cmd 의 따옴표 제거 규칙을 막는 관용구다.
+            subprocess.Popen(f'cmd /k ""{exe}" auth login"',
+                             creationflags=0x00000010)   # CREATE_NEW_CONSOLE
+            log.info("login terminal opened: %s", exe)
+        except OSError as e:
+            log.error("login terminal failed: %s", e)
+            if self.icon:
+                self.icon.notify("터미널을 열지 못했습니다 — 직접 터미널에서 "
+                                 "claude auth login 을 실행해 주세요.",
+                                 "Claude 사용량")
 
     def _worst(self):
         p = [x[1] for x in self.rows if x[1] is not None]
@@ -3084,6 +3168,8 @@ class TrayApp:
             elif kind == "reftest":
                 threading.Thread(target=self._refresh_test,
                                  daemon=True).start()
+            elif kind == "relogin":
+                self._open_login_terminal()
             elif kind == "token":
                 tok = ""
                 try:
