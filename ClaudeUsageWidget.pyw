@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.14.0"
+__version__ = "3.16.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -60,6 +60,13 @@ CHANGELOG_PAGE = f"https://github.com/{REPO}/blob/main/CHANGELOG.md"
 REPO_ZIP_URL = f"https://github.com/{REPO}/archive/refs/heads/main.zip"
 REPO_ZIP_TOPDIR = "ai-taskbar-widget-main"
 UPDATE_CHECK_SEC = 24 * 3600
+# EXE 배포본의 자동 업데이트 — v* 태그를 푸시하면 GitHub Actions가 빌드해
+# 릴리스에 EXE를 첨부하고(.github/workflows/release.yml), 위젯은 이 API로
+# 최신 릴리스를 확인해 스스로 교체한다.
+RELEASE_API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
+WIDGET_ASSET = "AI-Skill-Widget.exe"
+HOOK_ASSET = "SkillEventHook.exe"
+EXE_MIN_BYTES = 5_000_000       # 잘린 다운로드로 교체하는 사고 방지
 
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", HOME), APP_NAME)
 LOG_PATH = os.path.join(APPDATA_DIR, "widget.log")
@@ -734,6 +741,79 @@ def fetch_changelog():
         return r.read().decode("utf-8", "replace")
 
 
+def parse_release(text):
+    """releases/latest 응답 → (버전튜플, '3.16.0', 패치노트, {파일명: url}).
+
+    태그가 v3.16.0 꼴이 아니면(프리릴리스 실험 태그 등) None — 엉뚱한
+    태그로 자동 교체가 돌면 안 된다.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    tag = str(data.get("tag_name") or "").lstrip("vV").strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)*", tag):
+        return None
+    assets = {a.get("name"): a.get("browser_download_url")
+              for a in data.get("assets") or []
+              if a.get("name") and a.get("browser_download_url")}
+    return _ver_tuple(tag), tag, str(data.get("body") or ""), assets
+
+
+def fetch_latest_release():
+    # 오버라이드는 배포 전 검증용 — 가짜 릴리스 JSON을 물릴 수 있다
+    url = os.environ.get("CLAUDE_WIDGET_RELEASE_API") or RELEASE_API_URL
+    req = urllib.request.Request(url, headers={"User-Agent": CLI_UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return parse_release(r.read().decode("utf-8", "replace"))
+
+
+def download_file(url, dst):
+    req = urllib.request.Request(url, headers={"User-Agent": CLI_UA})
+    with urllib.request.urlopen(req, timeout=120) as r, open(dst, "wb") as f:
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+def check_exe(path):
+    """받은 파일이 온전한 EXE인지 — 크기와 PE 머리표(MZ)만 본다."""
+    if os.path.getsize(path) < EXE_MIN_BYTES:
+        raise RuntimeError("내려받은 EXE가 너무 작음 (잘린 다운로드)")
+    with open(path, "rb") as f:
+        if f.read(2) != b"MZ":
+            raise RuntimeError("내려받은 파일이 EXE가 아님")
+
+
+def finish_exe_update():
+    """직전 자동 업데이트의 뒷정리 — 옛 EXE 삭제, 미뤄 둔 훅 교체.
+
+    .old는 새 버전이 정상 기동했다는 뜻이므로 지운다(못 떴으면 남아 있어
+    수동 복구 단서가 된다). 구 프로세스의 파일 핸들이 늦게 놓일 수 있어
+    짧게 재시도한다.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    old = sys.executable + ".old"
+    for _ in range(6):
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+                log.info("previous exe cleaned up")
+            break
+        except OSError:
+            time.sleep(0.5)
+    hook = os.path.join(os.path.dirname(sys.executable), HOOK_ASSET)
+    try:
+        if os.path.exists(hook + ".new"):
+            os.replace(hook + ".new", hook)
+            log.info("pending hook exe swap finished")
+    except OSError:
+        pass                    # 훅이 하필 도는 중 — 다음 시작 때 다시
+
+
 def download_repo(dst):
     """저장소 zip을 받아 풀고 위젯 파일이 든 폴더 경로를 돌려준다."""
     import io
@@ -1113,8 +1193,13 @@ def _fullscreen_foreground():
             return False
         cn = ctypes.create_unicode_buffer(64)
         u.GetClassNameW(ctypes.c_void_p(fg), cn, 64)
+        # 뒤 네 개는 explorer의 일시 오버레이(Alt-Tab·작업 보기 등) — 화면을
+        # 통째로 덮은 채 잠깐 전면이 되어 전체화면 앱으로 오탐됐다(2026-08-27
+        # 로그: fs_fg=True fg=explorer.exe가 반복되며 바가 수시로 숨었다).
         if cn.value in ("Progman", "WorkerW", "Shell_TrayWnd",
-                        "Shell_SecondaryTrayWnd"):
+                        "Shell_SecondaryTrayWnd",
+                        "XamlExplorerHostIslandWindow", "MultitaskingViewFrame",
+                        "ForegroundStaging", "TaskListThumbnailWnd"):
             return False
         r = ctypes.wintypes.RECT()
         u.GetWindowRect(ctypes.c_void_p(fg), ctypes.byref(r))
@@ -1156,6 +1241,22 @@ WINEVENTPROC = ctypes.WINFUNCTYPE(
     None, ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.c_void_p,
     ctypes.wintypes.LONG, ctypes.wintypes.LONG,
     ctypes.wintypes.DWORD, ctypes.wintypes.DWORD)
+
+SRCCOPY = 0x00CC0020
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.wintypes.DWORD),
+                ("biWidth", ctypes.wintypes.LONG),
+                ("biHeight", ctypes.wintypes.LONG),
+                ("biPlanes", ctypes.wintypes.WORD),
+                ("biBitCount", ctypes.wintypes.WORD),
+                ("biCompression", ctypes.wintypes.DWORD),
+                ("biSizeImage", ctypes.wintypes.DWORD),
+                ("biXPelsPerMeter", ctypes.wintypes.LONG),
+                ("biYPelsPerMeter", ctypes.wintypes.LONG),
+                ("biClrUsed", ctypes.wintypes.DWORD),
+                ("biClrImportant", ctypes.wintypes.DWORD)]
 
 
 class FloatingBar(threading.Thread):
@@ -1212,14 +1313,28 @@ class FloatingBar(threading.Thread):
         # 소유 관계만으로는 위에 못 뜬다 — topmost 창은 별도 밴드라서
         # 소유자가 topmost면 non-topmost 소유 창은 그 아래로 가라앉는다.
         root.configure(bg=self.BG)
-        f = self._font = tkfont.Font(family="맑은 고딕", size=self.FONT_PX)
+        # 모니터 배율(DPI) 반영 — 바의 글자·여백은 픽셀 단위라, 배율을 곱하지
+        # 않으면 125%·150% 모니터에서 작업표시줄만 커지고 글자는 그대로 남아
+        # 깨알같이 보인다. 100% 모니터에서는 배율 1.0이라 지금과 똑같다.
+        scale = self._scale = self._dpi_scale()
+        px = self._px = lambda v: int(round(v * scale))
+        try:
+            # 포인트 단위 폰트(스킬 내역·알림 창)도 같은 배율을 따르게 한다
+            root.tk.call("tk", "scaling", scale * 96 / 72.0)
+        except Exception:
+            pass
+        self.PAD = px(FloatingBar.PAD)
+        self.PANEL_GAP = px(FloatingBar.PANEL_GAP)
+        self.SIDE = px(FloatingBar.SIDE)
+        f = self._font = tkfont.Font(family="맑은 고딕",
+                                     size=px(self.FONT_PX))
         # -8px는 한글이 뭉개진다 — 본문(-10)보다 한 단계만 작게
-        self._font_small = tkfont.Font(family="맑은 고딕", size=-9)
-        self._col_gap = max(9, f.measure(" ") * 3)  # 라벨-숫자 사이 간격
-        self._panel_w = f.measure("image-prompt-craft  999회  · 자동 999") + 24
-        self._usage_w = f.measure("Sonnet 100%  · 16시간 59분 후") + 24
+        self._font_small = tkfont.Font(family="맑은 고딕", size=px(-9))
+        self._col_gap = max(px(9), f.measure(" ") * 3)  # 라벨-숫자 사이 간격
+        self._panel_w = f.measure("image-prompt-craft  999회  · 자동 999") + px(24)
+        self._usage_w = f.measure("Sonnet 100%  · 16시간 59분 후") + px(24)
         self._fix_w = self._usage_w
-        self._fix_h = self.LINES * f.metrics("linespace") + 6
+        self._fix_h = self.LINES * f.metrics("linespace") + px(6)
         self._shown = False
         self._covered = 0
         self._ticks = 0
@@ -1237,6 +1352,8 @@ class FloatingBar(threading.Thread):
         self._sunk_log_at = 0.0     # "가라앉음" 로그 최근 시각 (5초 간격 제한)
         self._camo_at = 0.0
         self._camo_retry = 0        # 거친 조각을 만나 다시 노린 횟수 (상한 5)
+        self._rebuild = False       # 동결·배율 변화 감지 — 다음 틱에 창 재생성
+        self._strikes = 0           # 동결 의심 연속 횟수 (2회면 재생성)
         self._pal = self.PAL_DARK
         self._bgimg = None
         self._probe_warned = False
@@ -1538,6 +1655,32 @@ class FloatingBar(threading.Thread):
         except Exception:
             log.exception("lock apply failed")
 
+    def _dpi_scale(self):
+        """바가 놓일 모니터의 배율 (96dpi = 1.0). 못 읽으면 1.0.
+
+        창을 만들기 전에 폰트 크기를 정해야 해서, 창이 아니라 저장된 바
+        위치(없으면 주 모니터 트레이 근처)가 속한 모니터의 DPI를 좌표로
+        찾는다. 이후 배율이 바뀌면(_health_check) 창을 새로 만들며 다시 읽는다.
+        """
+        try:
+            u = ctypes.windll.user32
+            right, y = self.app.cfg.get("bar_right"), self.app.cfg.get("bar_y")
+            if right is None or y is None:
+                pt = ctypes.wintypes.POINT(u.GetSystemMetrics(0) - 40,
+                                           u.GetSystemMetrics(1) - 10)
+            else:
+                pt = ctypes.wintypes.POINT(int(right) - 10, int(y) + 5)
+            u.MonitorFromPoint.restype = ctypes.c_void_p
+            u.MonitorFromPoint.argtypes = [ctypes.wintypes.POINT,
+                                           ctypes.wintypes.DWORD]
+            mon = u.MonitorFromPoint(pt, 2)     # MONITOR_DEFAULTTONEAREST
+            dx, dy = ctypes.c_uint(96), ctypes.c_uint(96)
+            ctypes.windll.shcore.GetDpiForMonitor(
+                ctypes.c_void_p(mon), 0, ctypes.byref(dx), ctypes.byref(dy))
+            return min(max(dx.value / 96.0, 1.0), 4.0)
+        except Exception:
+            return 1.0
+
     def _place_initial(self):
         """위치는 오른쪽 끝(트레이 쪽) 기준으로 복원한다.
 
@@ -1554,7 +1697,7 @@ class FloatingBar(threading.Thread):
         ctypes.windll.user32.SystemParametersInfoW(0x0030, 0,
                                                    ctypes.byref(r), 0)
         if right is None:
-            right = sw - 330                       # 트레이 아이콘 왼쪽
+            right = sw - self._px(330)             # 트레이 아이콘 왼쪽
         # 줄이 늘어 바가 높아지면 저장된 y로는 화면 아래로 넘친다 — 다시 맞춘다
         if y is None or int(y) + h > sh:
             if sh > r.bottom:                      # 작업표시줄이 아래쪽
@@ -1745,7 +1888,7 @@ class FloatingBar(threading.Thread):
         """라벨 + 작은 꼬리표("루틴")가 차지하는 폭."""
         w = self._font.measure(row[0])
         if len(row) > 5 and row[5]:
-            w += self._font_small.measure(row[5]) + 4
+            w += self._font_small.measure(row[5]) + self._px(4)
         return w
 
     def _panel_width(self, lines):
@@ -1833,7 +1976,7 @@ class FloatingBar(threading.Thread):
         except tk.TclError:
             pass
 
-        width, height = 560, 440
+        width, height = self._px(560), self._px(440)
         x = max(8, min(self.root.winfo_x() + self._fix_w - width,
                        self.root.winfo_screenwidth() - width - 8))
         y = max(8, self.root.winfo_y() - height - 10)
@@ -2005,7 +2148,7 @@ class FloatingBar(threading.Thread):
         except tk.TclError:
             pass
 
-        width, height = 640, 520
+        width, height = self._px(640), self._px(520)
         x = max(8, min(self.root.winfo_x() + self._fix_w - width,
                        self.root.winfo_screenwidth() - width - 8))
         y = max(8, self.root.winfo_y() - height - 10)
@@ -2346,7 +2489,8 @@ class FloatingBar(threading.Thread):
             tree.selection_set(children[0])
 
     def _tick(self):
-        if self.app.stop_evt.is_set():
+        if self.app.stop_evt.is_set() or self._rebuild:
+            # _rebuild면 mainloop가 끝나고 run()의 재시도 루프가 새 창을 만든다
             self.root.destroy()
             return
         try:
@@ -2522,6 +2666,14 @@ class FloatingBar(threading.Thread):
             return          # 가림이 풀린 직후 한 틱은 더 본다 — 되보이기 깜빡임 방지
         if self._restore:   # 훅이 먼저 띄워 놨다 — 배경·z는 여기서 마무리한다
             self._restore = False
+            try:
+                if self.root.state() != "normal":
+                    # Win32로만 되살리면 Tk는 창이 내려간 줄 알고 그리기를
+                    # 전부 버린다 — Tk 쪽 상태도 함께 되살린다(NOACTIVATE라
+                    # deiconify가 포커스를 뺏지 않는다)
+                    self.root.deiconify()
+            except Exception:
+                pass
             self._match_background(force=True)
             self._adopt_by_taskbar()
             self._sync_topmost(raise_now=True)
@@ -2554,6 +2706,8 @@ class FloatingBar(threading.Thread):
             self._poll_translation()
         self._show(True)
         self._apply_lock()
+        if self._ticks % self.CAMO_EVERY == 0:
+            self._health_check()
 
     def _columns(self, lines, base=0):
         """세 줄이 같은 열에 서도록 (값 오른쪽끝 x, 시간 시작 x)를 구한다."""
@@ -2579,9 +2733,91 @@ class FloatingBar(threading.Thread):
         self.cv.itemconfigure(tg, text=tag, fill=lcolor or self._pal["label"])
         y = self._ys[idx % self.LINES]
         self.cv.coords(l, base + self.PAD, y)
-        self.cv.coords(tg, base + self.PAD + self._font.measure(label) + 4, y)
+        self.cv.coords(tg,
+                       base + self.PAD + self._font.measure(label) + self._px(4),
+                       y)
         self.cv.coords(v, cols[0], y)      # 값은 오른쪽 정렬 — 끝이 맞는다
         self.cv.coords(w, cols[1], y)
+
+    def _bar_contrast(self, x, y, w, h):
+        """바 영역의 밝기 폭 (가장 어두운 값, 가장 밝은 값).
+
+        글자가 그려져 있으면 폭이 크고(실측 31~225), 동결돼 단색만 남으면
+        0에 가깝다. PIL의 ImageGrab은 쓰지 않는다 — bbox를 줘도 화면 전체를
+        뜬 뒤 잘라내서(실측: 840px나 370만px이나 똑같이 26.5ms, CPU 12.5ms)
+        모니터가 크고 많을수록 비싸진다. 바 영역만 뜨면 CPU 0.4ms로 끝난다.
+        """
+        u, g = ctypes.windll.user32, ctypes.windll.gdi32
+        sdc = mdc = bmp = None
+        try:
+            sdc = u.GetDC(0)
+            mdc = g.CreateCompatibleDC(sdc)
+            bmp = g.CreateCompatibleBitmap(sdc, w, h)
+            g.SelectObject(mdc, bmp)
+            g.BitBlt(mdc, 0, 0, w, h, sdc, x, y, SRCCOPY)
+            hdr = BITMAPINFOHEADER()
+            hdr.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            hdr.biWidth, hdr.biHeight = w, -h       # 음수 = 위에서 아래로
+            hdr.biPlanes, hdr.biBitCount = 1, 32
+            buf = ctypes.create_string_buffer(w * h * 4)
+            if not g.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(hdr), 0):
+                return None
+        finally:
+            if bmp:
+                g.DeleteObject(bmp)
+            if mdc:
+                g.DeleteDC(mdc)
+            if sdc:
+                u.ReleaseDC(0, sdc)
+        # 한 채널만 잘라 C 속도로 min/max — 알파는 고정값이라 건너뛴다
+        chan = buf.raw[0::4]
+        return (min(chan), max(chan)) if chan else None
+
+    def _health_check(self):
+        """동결·배율 변화 감시 — 걸리면 바 창을 버리고 새로 만든다.
+
+        2026-08-27 실측: 시작 직후 숨김/복귀가 겹친 뒤 Tk가 이 창에 대한
+        그리기를 화면에 전혀 반영하지 않는 상태가 생겼다 — 캔버스는 최초
+        단색 배경으로 얼고, 외부에서 RedrawWindow를 보내도 깨어나지 않았다
+        (프로세스 재시작만 유효). 원인이 Tk/DWM 내부라 직접 풀 수 없어,
+        겉으로 드러나는 증상(글자를 그렸는데 바 영역이 균일한 단색)을 10초
+        간격 2회 연속으로 확인하면 창을 재생성한다. 모니터 배율(DPI)
+        변화도 같은 경로로 창을 다시 만든다.
+
+        위치 비교(Tk가 아는 x vs 실제 x)는 쓰지 않는다 — `winfo_x()`는
+        Tk가 요청한 값이 아니라 Windows의 실제 값을 되읽어오므로 둘은 항상
+        같다(실측). 동결을 가려내지 못하는 검사다.
+        """
+        try:
+            u = ctypes.windll.user32
+            hwnd = self._hwnd
+            if not hwnd or not self._shown:
+                return
+            try:
+                dpi = u.GetDpiForWindow(ctypes.c_void_p(hwnd))
+            except Exception:
+                dpi = 0                 # Win10 1607 미만 — 배율 감시만 포기
+            if dpi and abs(dpi / 96.0 - self._scale) > 0.01:
+                log.info("bar dpi %d -> %d - rebuilding",
+                         round(self._scale * 96), dpi)
+                self._rebuild = True
+                return
+            if not any(k and k[0] for k in self._last if k):
+                return                  # 그려 둔 글자가 없다 — 판정 보류
+            r = ctypes.wintypes.RECT()
+            u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r))
+            span = self._bar_contrast(r.left, r.top,
+                                      r.right - r.left, r.bottom - r.top)
+            if span is None:
+                return
+            stuck = span[1] - span[0] < 24
+            self._strikes = self._strikes + 1 if stuck else 0
+            if self._strikes >= 2:
+                log.info("bar frozen (contrast %d) - rebuilding",
+                         span[1] - span[0])
+                self._rebuild = True
+        except Exception:
+            log.exception("health check failed")
 
     def _log_hide(self, who, fullscreen=None):
         """바가 숨는 순간의 판단 근거 — 캡처류 오탐이 재발하면 이 줄로 원인을 본다."""
@@ -2614,6 +2850,15 @@ class FloatingBar(threading.Thread):
             if not self._mapped:
                 self.root.deiconify()   # Tk 상태를 normal로 만드는 건 한 번만
                 self._mapped = True
+            else:
+                try:
+                    if self.root.state() != "normal":
+                        # Win32 숨김을 Tk가 '내려감'으로 기록한 채 남으면 이후
+                        # 그리기·이동이 전부 무시된다(2026-08-27 동결 실측) —
+                        # 표시할 때마다 상태가 어긋나 있으면 되살린다
+                        self.root.deiconify()
+                except Exception:
+                    pass
             self._win_show(True)        # 먼저 띄운다 — 배경 촬영이 복귀를 늦추면 안 된다
             self._adopt_by_taskbar()    # 표시 후에 걸어야 Tk가 안 지운다
             self._sync_topmost(raise_now=True)
@@ -2743,21 +2988,50 @@ class TrayApp:
 
     # ---------------- 업데이트
     def _check_update(self):
-        """CHANGELOG의 최신 버전이 내 버전보다 높으면 알림 + 메뉴 항목 준비."""
-        if getattr(sys, "frozen", False):
-            return  # exe 배포본은 설치 프로그램으로만 안전하게 갱신한다
-        entries = parse_changelog(fetch_changelog())
-        if not entries:
-            return
+        """새 버전 확인. EXE 배포본은 릴리스에서 받아 스스로 교체하고(기본,
+        트레이 토글로 끌 수 있다), 소스 실행은 예전처럼 알림 + 메뉴 항목만."""
         cur = _ver_tuple(__version__)
-        if entries[0][0] <= cur:
-            self.update_info = None
-            return
-        latest = entries[0][1]
-        notes = "\n\n".join(f"v{s}\n{body}" for t, s, body in entries
-                            if t > cur)
-        self.update_info = (latest, notes)
-        log.info("update available: v%s (current v%s)", latest, __version__)
+        if getattr(sys, "frozen", False):
+            # 시작 직후엔 구 부트로더가 제 EXE 잠금을 늦게 놓아 .old 삭제가
+            # 실패할 수 있다(실측 3초+) — 30초 뒤 첫 확인 때 한 번 더 치운다
+            finish_exe_update()
+            rel = fetch_latest_release()
+            if not rel:
+                return
+            ver_t, latest, notes, assets = rel
+            if ver_t <= cur or not assets.get(WIDGET_ASSET):
+                self.update_info = None
+                return
+            log.info("update available: v%s (current v%s)",
+                     latest, __version__)
+            if self.cfg.get("auto_update", True):
+                if self._updating:
+                    return
+                self._updating = True
+                try:
+                    if self.icon:
+                        self.icon.notify(
+                            f"새 버전 v{latest} 설치 중 — 잠시 후 재시작합니다",
+                            "Claude 위젯 업데이트")
+                    self._install_release(latest, assets)
+                    return
+                except Exception:
+                    # 자동 설치 실패 — 다음 줄부터의 알림·메뉴 경로로 넘긴다
+                    log.exception("auto update failed")
+                    self._updating = False
+        else:
+            entries = parse_changelog(fetch_changelog())
+            if not entries:
+                return
+            if entries[0][0] <= cur:
+                self.update_info = None
+                return
+            latest = entries[0][1]
+            notes = "\n\n".join(f"v{s}\n{body}" for t, s, body in entries
+                                if t > cur)
+            assets = None
+        self.update_info = (latest, notes, assets)
+        log.info("update menu ready: v%s (current v%s)", latest, __version__)
         if self.cfg.get("notified_version") != latest:
             self.cfg["notified_version"] = latest
             save_config(self.cfg)
@@ -2767,15 +3041,76 @@ class TrayApp:
                                  "Claude 위젯 업데이트")
                 log.info("update toast shown: v%s", latest)
 
+    def _install_release(self, ver, assets):
+        """릴리스의 새 EXE를 받아 제자리 교체 후 재시작.
+
+        실행 중인 EXE는 덮어쓸 수 없지만 이름 바꾸기는 되므로,
+        새 EXE를 .new 로 다 받아 검증한 뒤 [현재 → .old, .new → 제자리]
+        순서로 바꾼다. 두 번째 rename이 실패하면 첫 번째를 되돌려
+        반쯤 바뀐 채 끝나지 않게 한다. .old 는 다음 시작이 지운다
+        (finish_exe_update — 새 버전이 못 떴으면 수동 복구용으로 남는다).
+        """
+        import subprocess
+        exe = sys.executable
+        new, old = exe + ".new", exe + ".old"
+        download_file(assets[WIDGET_ASSET], new)
+        check_exe(new)
+        hook = os.path.join(os.path.dirname(exe), HOOK_ASSET)
+        hurl = assets.get(HOOK_ASSET)
+        if hurl and os.path.exists(hook):
+            try:
+                download_file(hurl, hook + ".new")
+                check_exe(hook + ".new")
+                os.replace(hook + ".new", hook)  # 순간 실행이라 대개 안 잠겨 있다
+            except (OSError, RuntimeError):
+                pass        # 잠겼으면 .new 가 남고, 다음 시작 때 마저 바꾼다
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+        except OSError:
+            pass
+        os.rename(exe, old)
+        try:
+            os.rename(new, exe)
+        except OSError:
+            os.rename(old, exe)         # 되돌린다
+            raise
+        log.info("update installed: v%s (exe swap)", ver)
+        # 구 인스턴스가 싱글턴 포트를 놓은 뒤(약 3초) 새 인스턴스를 띄운다
+        subprocess.Popen(
+            f'cmd /c ping -n 4 127.0.0.1 >nul & start "" "{exe}"',
+            creationflags=0x08000008)   # DETACHED | CREATE_NO_WINDOW
+        self.q.put(("quit",))
+
     def _do_update(self):
-        """패치노트를 보여주고 확인하면 zip으로 교체 후 재시작. (별도 스레드)"""
+        """패치노트를 보여주고 확인하면 교체 후 재시작. (별도 스레드)
+
+        EXE 배포본은 릴리스의 새 EXE로, 소스 실행은 저장소 zip으로 바꾼다.
+        """
         import shutil
         import subprocess
         import tempfile
         info = self.update_info
         if not info or self._updating:
             return
-        ver, notes = info
+        ver, notes = info[0], info[1]
+        if getattr(sys, "frozen", False):
+            assets = info[2] or {}
+            ok = _msgbox(f"v{ver} 패치노트:\n\n{notes[:1500]}\n\n"
+                         "지금 설치하고 재시작할까요?",
+                         f"Claude 위젯 업데이트 v{ver}", 0x41)  # OKCANCEL|INFO
+            if ok != 1:                                         # IDOK
+                return
+            self._updating = True
+            try:
+                self._install_release(ver, assets)
+            except Exception as e:
+                log.exception("update failed")
+                self._updating = False
+                _msgbox(f"업데이트 실패: {e}\n\n"
+                        "README의 설치 명령으로 다시 설치하면 해결됩니다.",
+                        "Claude 위젯 업데이트", 0x10)           # MB_ICONERROR
+            return
         here = os.path.dirname(os.path.abspath(__file__))
         if os.path.isdir(os.path.join(here, ".git")):
             _msgbox(f"v{ver} 패치노트:\n\n{notes[:1500]}\n\n"
@@ -3026,6 +3361,13 @@ class TrayApp:
         if self.update_info:
             upd = [pystray.MenuItem(f"새 버전 v{self.update_info[0]} 설치…",
                                     lambda i, it: self.q.put(("update",)))]
+        # 자동 설치 토글은 EXE 배포본에서만 — 소스 실행은 자동 교체가 없다
+        autoupd = []
+        if getattr(sys, "frozen", False):
+            autoupd = [pystray.MenuItem(
+                "새 버전 자동 설치",
+                lambda i, it: self.q.put(("autoupd",)),
+                checked=lambda it: bool(self.cfg.get("auto_update", True)))]
         # 재로그인은 인증이 끊겼을 때만 — 평소엔 눌러도 할 일이 없는 항목이다
         auth = []
         if self.auth_notice:
@@ -3062,6 +3404,7 @@ class TrayApp:
             pystray.MenuItem("Windows 시작 시 자동 실행",
                              lambda i, it: self.q.put(("startup",)),
                              checked=lambda it: startup_installed()),
+            *autoupd,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("패치 이력 보기", lambda i, it: self.q.put(("notes",))),
             pystray.MenuItem("로그 폴더 열기", lambda i, it: self.q.put(("log",))),
@@ -3208,6 +3551,10 @@ class TrayApp:
             elif kind == "startup":
                 uninstall_startup() if startup_installed() else install_startup()
                 self._refresh_tray()
+            elif kind == "autoupd":
+                self.cfg["auto_update"] = not self.cfg.get("auto_update", True)
+                save_config(self.cfg)
+                self._refresh_tray()
             elif kind == "update":
                 threading.Thread(target=self._do_update, daemon=True).start()
             elif kind == "notes":
@@ -3274,6 +3621,7 @@ def main():
     acquire_singleton()
     log.info("---- tray v%s start (python %s) ----",
              __version__, sys.version.split()[0])
+    finish_exe_update()     # 직전 자동 업데이트의 .old 삭제·훅 교체 마무리
     TrayApp().run()
 
 

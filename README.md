@@ -49,7 +49,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 - EXE를 `%LOCALAPPDATA%\AI-Skill-Widget`에 복사하고 Windows 자동 시작에 등록
 - Claude 훅을 기존 설정에 **병합** — 기존 `~/.claude/settings.json`은
   `settings.json.skill-widget.bak`으로 백업
-- 새 버전은 위젯이 하루 한 번 이 저장소의 패치 이력을 읽어 알려줍니다
+- 새 버전은 위젯이 하루 한 번 GitHub 릴리스를 확인해 **자동으로 설치**합니다
+  (트레이 메뉴 `새 버전 자동 설치` 토글로 끄면 알림·수동 설치만)
 
 제거(스킬 호출 기록 DB는 보존):
 
@@ -186,8 +187,8 @@ powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\scheduled-tas
 | Claude 사용량 조회 | `api.anthropic.com` | 로그인 토큰으로 잔량만 읽기 |
 | Claude 토큰 갱신 | `platform.claude.com` | 만료된 로그인 토큰 갱신 |
 | Codex 사용량 조회 | `chatgpt.com` | auth.json 토큰으로 잔량만 읽기 |
-| 업데이트 확인 (하루 1회) | `raw.githubusercontent.com` | 패치 이력을 읽기만 |
-| 업데이트 설치 (직접 선택 시) | `github.com` | 소스 zip 다운로드 |
+| 업데이트 확인 (하루 1회) | `api.github.com` | 최신 릴리스 버전만 읽기 |
+| 업데이트 설치 (자동, 끌 수 있음) | `github.com` | 릴리스의 새 EXE 다운로드 |
 | 스킬 설명 번역 | `translate.googleapis.com` | 스킬 설명 텍스트(공개 문서)만 |
 
 <details>

@@ -1,0 +1,53 @@
+# v* 태그를 푸시하면 EXE를 빌드해 GitHub 릴리스에 첨부한다.
+# 위젯(3.16.0+)은 releases/latest 를 하루 한 번 확인해 스스로 교체하므로,
+# 배포는 [버전·CHANGELOG 갱신 → 커밋 → 태그 푸시] 로 끝난다:
+#   git tag v3.16.0 && git push origin main --tags
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 태그와 __version__ 일치 확인
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path ClaudeUsageWidget.pyw `
+                -Pattern '__version__ = "([^"]+)"').Matches[0].Groups[1].Value
+          $tag = "$env:GITHUB_REF_NAME".TrimStart("v")
+          if ($v -ne $tag) { throw "태그 v$tag ≠ __version__ $v — 버전을 맞춘 뒤 태그를 다시 만드세요" }
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: EXE 빌드
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: 패치노트 추출 (CHANGELOG 최신 항목)
+        shell: pwsh
+        run: |
+          $md = Get-Content CHANGELOG.md -Raw
+          $m = [regex]::Match($md, '(?ms)^## v.+?(?=^## v|\z)')
+          Set-Content RELEASE_NOTES.md $m.Value -Encoding utf8
+
+      - name: 릴리스 생성 + EXE 첨부
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AI-Skill-Widget.exe
+            dist/SkillEventHook.exe
+          body_path: RELEASE_NOTES.md
