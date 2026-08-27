@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.16.0"
+__version__ = "3.16.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1299,6 +1299,8 @@ class FloatingBar(threading.Thread):
                 self._run()
             except Exception:
                 log.exception("floating bar crashed")
+            finally:
+                self._unhook_events()   # 예외로 튀어나온 경우까지 확실히
             if self.app.stop_evt.is_set():
                 break
             time.sleep(5)   # 탐색기 재시작 등으로 창이 죽으면 새로 만든다
@@ -2490,7 +2492,9 @@ class FloatingBar(threading.Thread):
 
     def _tick(self):
         if self.app.stop_evt.is_set() or self._rebuild:
-            # _rebuild면 mainloop가 끝나고 run()의 재시도 루프가 새 창을 만든다
+            # _rebuild면 mainloop가 끝나고 run()의 재시도 루프가 새 창을 만든다.
+            # 훅을 먼저 떼야 한다 — 죽은 창을 가리키는 콜백이 남으면 크래시
+            self._unhook_events()
             self.root.destroy()
             return
         try:
@@ -2519,6 +2523,22 @@ class FloatingBar(threading.Thread):
                      [bool(h) for h in self._hooks])
         except Exception:
             log.exception("hook install failed")
+
+    def _unhook_events(self):
+        """WinEvent 훅 해제 — 창을 새로 만들기 전에 반드시 부른다.
+
+        훅을 건 채로 `_winproc`를 새 것으로 갈아치우면 옛 콜백 객체가
+        수거되는데, 훅은 살아 있어서 Windows가 그 빈 자리를 호출한다.
+        그 순간 프로세스가 통째로 죽는다 — 로그 한 줄 없이 사라진다
+        (실측 2026-08-27: 재부팅 뒤 재생성 직후 APPCRASH c000041d).
+        """
+        for h in getattr(self, "_hooks", None) or []:
+            try:
+                if h:
+                    ctypes.windll.user32.UnhookWinEvent(ctypes.c_void_p(h))
+            except Exception:
+                pass
+        self._hooks = []
 
     def _watch_hide(self):
         """훅이 놓친 전환을 위한 보험 — 숨기는 쪽만 본다.
@@ -2793,6 +2813,12 @@ class FloatingBar(threading.Thread):
             hwnd = self._hwnd
             if not hwnd or not self._shown:
                 return
+            # 창을 만든 직후 1분은 판정하지 않는다 — 로그인 직후에는 바탕이
+            # 아직 안 그려져 화면 읽기가 통째로 검게 나온다(실측 2026-08-27:
+            # 재부팅 30초 뒤 멀쩡한 바를 동결로 오판해 재생성했다).
+            # 재생성 뒤에도 _ticks가 0부터라 새 창에도 같은 유예가 걸린다.
+            if self._ticks < 120:
+                return
             try:
                 dpi = u.GetDpiForWindow(ctypes.c_void_p(hwnd))
             except Exception:
@@ -2811,8 +2837,16 @@ class FloatingBar(threading.Thread):
             if span is None:
                 return
             stuck = span[1] - span[0] < 24
+            # 진짜 동결이면 우리가 칠해 둔 배경색이 그대로 남아 보인다.
+            # 전혀 다른 색(대개 검정)이면 동결이 아니라 화면을 못 읽은 것 —
+            # 그걸 세면 멀쩡한 바를 부순다. _rgb는 옆 작업표시줄에서 뜬 색.
+            if stuck and self._rgb is not None and                     abs(span[1] - self._rgb[2]) > 24:
+                log.info("screen unreadable (flat %d, bg %d) - not frozen",
+                         span[1], self._rgb[2])
+                self._strikes = 0
+                return
             self._strikes = self._strikes + 1 if stuck else 0
-            if self._strikes >= 2:
+            if self._strikes >= 3:      # 10초 간격 3연속 — 오탐 여유를 둔다
                 log.info("bar frozen (contrast %d) - rebuilding",
                          span[1] - span[0])
                 self._rebuild = True
