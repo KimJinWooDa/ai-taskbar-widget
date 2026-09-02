@@ -6,7 +6,7 @@
 
 [![Platform](https://img.shields.io/badge/Windows%2010%2F11-0078d4?style=flat-square)](#설치)
 [![Runtime](https://img.shields.io/badge/Standalone_EXE-no_Python-2ea043?style=flat-square)](#설치)
-[![Version](https://img.shields.io/badge/version-v3.14.0-d97757?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v3.17.0-d97757?style=flat-square)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-6e7681?style=flat-square)](LICENSE)
 
 **[설치](#설치)** · **[화면 구성](#화면-구성)** · **[루틴 알림](#루틴-알림)** · **[스킬 집계](#스킬-집계)** · **[개인정보](#네트워크와-개인정보)** · **[패치 이력](CHANGELOG.md)**

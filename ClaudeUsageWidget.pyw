@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.16.1"
+__version__ = "3.17.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -151,6 +151,10 @@ def short_reset(val):
 # 폴백한다. 폴백 값은 Codex를 실제로 쓸 때만 갱신되는 과거 기록이라,
 # 주간 창이 그 사이 리셋됐으면 실제보다 높게 보일 수 있다(2026-08-13
 # 실제로 그 어긋남 신고가 있었다 — 그래서 API가 1차다).
+#
+# 창 구성은 요금제(plan_type)마다 다르다 — 5시간+주간인 요금제가 있고,
+# 주간 하나뿐인 요금제(prolite 등)도 있다. 그래서 모든 읽기에 요금제를
+# 함께 실어 두고, 요금제가 다른 기록끼리는 절대 섞지 않는다.
 CODEX_HOME_DIR = os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex"))
 CODEX_AUTH_PATH = os.path.join(CODEX_HOME_DIR, "auth.json")
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -159,10 +163,13 @@ CODEX_SNAP_MAX_AGE = 8 * 86400      # 주간 창이 한 바퀴 돈 스냅샷은 
 CODEX_TAIL_BYTES = 512 * 1024
 CODEX_SCAN_FILES = 8
 CODEX_TAIL_EVENTS = 40              # 창을 다 못 찾았을 때 거슬러 볼 이벤트 수
+CODEX_WINDOW_KEEP_SEC = 900         # 이만큼 응답에서 빠진 창은 없어진 창으로 본다
 
 _codex_cache = (None, None)         # ((최신 파일, mtime), 스냅샷)
 _codex_api_note = None              # 마지막 API 실패 사유 — 바뀔 때만 로그
 _codex_last = None                  # 창 길이별로 살아 있는 마지막 값
+_codex_plan = None                  # 마지막으로 확인된 요금제 (plan_type)
+_codex_plan_ts = 0                  # 그 요금제를 확인한 읽기의 시각
 
 
 def codex_usage_api():
@@ -204,11 +211,12 @@ def codex_usage_api():
     if not wins:
         return None
     wins.sort(key=lambda w: w["minutes"] or 0)
+    plan = data.get("plan_type")
     if _codex_api_note != "ok":
         _codex_api_note = "ok"
-        log.info("codex usage api ok: %s",
+        log.info("codex usage api ok (plan %s): %s", plan or "?",
                  [(w["minutes"], round(w["pct"])) for w in wins])
-    return {"windows": wins, "ts": time.time()}
+    return {"windows": wins, "ts": time.time(), "plan": plan}
 
 
 def _codex_tail_snapshot(path):
@@ -220,6 +228,9 @@ def _codex_tail_snapshot(path):
     거슬러 올라간다. 리셋 시각이 이미 지난 창은 지금 값이 아니라서 줍지
     않지만, 그렇게 해서 아무것도 안 남으면 예전처럼 마지막 이벤트를
     그대로 돌려준다(패널이 통째로 사라지지 않게).
+
+    거슬러 올라가다 요금제(plan_type)가 달라지면 거기서 멈춘다 — 요금제를
+    바꾸기 전 기록은 지금 없는 창을 되살릴 뿐이다.
     """
     try:
         size = os.path.getsize(path)
@@ -229,7 +240,7 @@ def _codex_tail_snapshot(path):
     except OSError:
         return None
     now = time.time()
-    found, newest, ts, seen = {}, None, None, 0
+    found, newest, ts, seen, plan = {}, None, None, 0, None
     for raw in reversed(data.splitlines()):
         if b'"rate_limits"' not in raw:
             continue
@@ -247,11 +258,14 @@ def _codex_tail_snapshot(path):
             continue        # limit_id=premium 등 창이 비어 오는 이벤트도 있다
         if ts is None:
             newest = wins
+            plan = rl.get("plan_type")
             try:
                 ts = datetime.datetime.fromisoformat(
                     obj["timestamp"].replace("Z", "+00:00")).timestamp()
             except (KeyError, ValueError):
                 ts = os.path.getmtime(path)
+        elif rl.get("plan_type") != plan:
+            break           # 요금제를 바꾸기 전 기록 — 지금 창과 섞지 않는다
         for w in wins:
             resets = w["resets_at"]
             if w["minutes"] in found or (resets and now >= resets):
@@ -265,7 +279,7 @@ def _codex_tail_snapshot(path):
         return None
     # 짧은 창(일간류)이 먼저 — 바에서 Claude처럼 첫 줄이 짧은 창이 된다
     return {"windows": sorted(wins, key=lambda w: w["minutes"] or 0),
-            "ts": ts}
+            "ts": ts, "plan": plan}
 
 
 def codex_rate_snapshot():
@@ -313,24 +327,45 @@ def codex_merge(snap):
     다음 조회에 되돌아와, 사용자 눈에는 "주간만 나온다"로 보였다
     (2026-08-26 신고). 창 길이를 키로 직전 값을 이어 붙이되 리셋 시각이
     지난 창은 버려, 이미 리셋된 옛 값을 되살리지는 않는다.
+
+    다만 요금제를 바꾸면 창 구성 자체가 달라진다 — ChatGPT Pro(prolite)는
+    5시간 창 없이 주간 하나뿐이라, "잠깐 빠진 창"으로 오해한 옛 5시간
+    100%가 그 창의 리셋 시각이 올 때까지 바에 박제됐다(2026-08-31 신고).
+    그래서 ①요금제가 바뀌면 직전 값을 통째로 버리고 ②바꾸기 전 기록으로
+    만든 읽기는 무시하며 ③같은 요금제라도 CODEX_WINDOW_KEEP_SEC 넘게 안
+    실려 온 창은 없어진 창으로 보고 지운다.
     """
-    global _codex_last
+    global _codex_last, _codex_plan, _codex_plan_ts
     now = time.time()
+    plan = (snap or {}).get("plan")
+    ts = (snap or {}).get("ts") or 0
+    if snap and plan and _codex_plan and plan != _codex_plan:
+        if ts < _codex_plan_ts:
+            snap = None                 # 요금제를 바꾸기 전 기록이다
+        else:
+            log.info("codex plan changed: %s -> %s - dropping old windows",
+                     _codex_plan, plan)
+            _codex_last = None
+    if snap and plan:
+        _codex_plan, _codex_plan_ts = plan, max(ts, _codex_plan_ts)
     wins, seen = [], set()
     for w in (snap or {}).get("windows", []):
-        wins.append(w)
+        wins.append(dict(w, seen=now))
         seen.add(w.get("minutes"))
     for w in (_codex_last or {}).get("windows", []):
         m, resets = w.get("minutes"), w.get("resets_at")
         if m is None or m in seen or not resets or now >= resets:
             continue
+        if now - (w.get("seen") or 0) > CODEX_WINDOW_KEEP_SEC:
+            continue    # 오래 안 실려 온 창 — 요금제에서 없어진 것으로 본다
         wins.append(w)
         seen.add(m)
     if not wins:
         _codex_last = None
         return None
     wins.sort(key=lambda w: w.get("minutes") or 0)
-    _codex_last = {"windows": wins, "ts": (snap or _codex_last)["ts"]}
+    _codex_last = {"windows": wins, "ts": (snap or _codex_last)["ts"],
+                   "plan": _codex_plan}
     return _codex_last
 
 
@@ -1779,8 +1814,9 @@ class FloatingBar(threading.Thread):
         """Codex 사용량 — Claude 패널과 똑같은 꼴.
 
         첫 줄은 앱명(Codex, 앱색) 줄로 Claude의 세션처럼 짧은 창(일간류)이
-        붙고, "주간"은 Claude처럼 제 줄에 기본색 라벨로 내려간다. 짧은
-        창이 기록에 없으면 첫 줄은 앱명만 남는다.
+        붙고, "주간"은 Claude처럼 제 줄에 기본색 라벨로 내려간다. 요금제에
+        짧은 창이 없으면(ChatGPT Pro는 주간 하나뿐이다) 첫 줄에 주간 값을
+        올리고 "주간" 꼬리표를 달아, 앱명만 덩그러니 남지 않게 한다.
         리셋 지난 값은 지어내지 않고 '리셋 지남'으로 둔다.
 
         앱명 옆에 창 길이 꼬리표("Codex 5시간")를 붙이지 않는다 — Claude
@@ -1797,20 +1833,25 @@ class FloatingBar(threading.Thread):
         accent = self.ACCENTS["codex"]
         now = time.time()
 
-        def row(label, win, lcolor):
+        def row(label, win, lcolor, tag=""):
             resets = win.get("resets_at")
             if resets and now >= resets:
-                return (label, "—", " · 리셋 지남", lcolor, accent, "")
+                return (label, "—", " · 리셋 지남", lcolor, accent, tag)
             t = short_reset(resets)
             return (label, f"{round(self._disp_pct(win['pct']))}%",
                     f" · {t}" if t else "",
-                    lcolor, self._value_color(win["pct"]), "")
+                    lcolor, self._value_color(win["pct"]), tag)
 
         # 이틀 미만 창(일간류)만 앱명 줄에, 그 이상은 "주간" 줄로
         short = [w for w in snap["windows"] if (w.get("minutes") or 0) < 2880]
         week = [w for w in snap["windows"] if (w.get("minutes") or 0) >= 2880]
         if short:
             lines = [row("Codex", short[0], accent)]
+        elif week:
+            # 주간 창 하나뿐인 요금제(ChatGPT Pro 등) — 앱명 줄을 빈칸으로
+            # 두지 않고 주간 값을 올리되, 세션 값으로 오해하지 않게 꼬리표를
+            # 단다. Claude 패널의 첫 줄과 규격이 어긋나 보이지 않는 선.
+            lines = [row("Codex", week.pop(0), accent, "주간")]
         else:
             lines = [("Codex", "", "", accent, accent, "")]
         for win in week[:self.LINES - 1]:
