@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.17.0"
+__version__ = "3.17.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -76,6 +76,7 @@ CACHE_MAX_AGE = 24 * 3600
 STARTUP_DIR = os.path.join(os.environ.get("APPDATA", ""),
                            r"Microsoft\Windows\Start Menu\Programs\Startup")
 STARTUP_VBS = os.path.join(STARTUP_DIR, "ClaudeUsageWidget.vbs")
+STARTUP_TASK = "AI Taskbar Widget"      # install.ps1이 등록하는 로그온 예약 작업
 
 WINDOW_LABELS = [
     ("five_hour", "현재 세션"),
@@ -1465,6 +1466,7 @@ class FloatingBar(threading.Thread):
                                             ctypes.c_void_p]
             u.SetWindowLongPtrW(ctypes.c_void_p(hwnd), -8,
                                 ctypes.c_void_p(tray))
+            self._hwnd = hwnd       # 소유가 풀렸다 = Tk가 창을 새로 만들었다
             log.info("bar owned by taskbar")
         except Exception:
             log.exception("adopt failed")
@@ -1741,7 +1743,20 @@ class FloatingBar(threading.Thread):
                 y = r.bottom + max((sh - r.bottom - h) // 2, 0)
             else:
                 y = sh - h - 8
+        # 여기서 정한 자리가 이후 모든 위치 계산(_anchor_xy)의 앵커다 — 창의
+        # 현재 좌표를 되읽지 않으므로 숨김 중의 스테일 값이 끼어들 수 없다
+        self.app.cfg["bar_right"] = int(right)
+        self.app.cfg["bar_y"] = int(y)
         self.root.geometry(f"{w}x{h}+{int(right) - w}+{int(y)}")
+
+    def _anchor_xy(self):
+        """저장된 앵커(오른쪽 끝·y)로 현재 폭의 바가 놓일 왼쪽 위 좌표."""
+        right = self.app.cfg.get("bar_right")
+        y = self.app.cfg.get("bar_y")
+        if right is None or y is None:      # _place_initial 전 — 있을 수 없지만
+            self._place_initial()
+            right, y = self.app.cfg["bar_right"], self.app.cfg["bar_y"]
+        return int(right) - self._fix_w, int(y)
 
     def _press(self, e):
         if self.app.cfg.get("bar_locked"):
@@ -1956,23 +1971,20 @@ class FloatingBar(threading.Thread):
             return
         self._panel_widths = list(widths)
         self._fix_w = sum(widths) + self.PANEL_GAP * (len(widths) - 1)
-        y = self.root.winfo_y()
         # 오른쪽 끝을 고정해 패널이 늘 때 트레이 쪽이 아니라 왼쪽으로 자란다.
         #
-        # 앵커는 설정에 저장된 bar_right가 유일한 진실이다. 예전처럼 창의 현재
-        # x에서 되계산하면(x + 폭), 기동 직후 _place_initial의 geometry가 아직
-        # 반영되지 않은 x를 읽어 앵커가 패널 폭만큼 오염된다 — 재시작 한 번에
-        # +137px씩 오른쪽으로 밀려 결국 화면 밖으로 나갔다(실측 2548→2685→2822).
-        # 여기서는 bar_right를 읽기만 하고, 쓰는 것은 사용자가 드래그로 자리를
-        # 정하는 _save_pos 한 곳뿐이다.
-        right = self.app.cfg.get("bar_right")
-        if right is None:                       # 첫 실행 — 지금 자리를 앵커로
-            right = self.root.winfo_x() + self._fix_w
-            self.app.cfg["bar_right"] = int(right)
-        x = int(right) - self._fix_w
+        # 앵커는 설정에 저장된 bar_right·bar_y가 유일한 진실이다. 예전처럼 창의
+        # 현재 x에서 되계산하면(x + 폭), 기동 직후 _place_initial의 geometry가
+        # 아직 반영되지 않은 x를 읽어 앵커가 패널 폭만큼 오염된다 — 재시작 한
+        # 번에 +137px씩 오른쪽으로 밀려 결국 화면 밖으로 나갔다(실측 2548→2685→
+        # 2822). y도 같은 이유로 winfo_y()를 읽지 않는다 — 창이 숨어 있는 동안
+        # Tk는 위치 요청을 무시하고 옛 좌표(첫 실행이면 0,0)를 돌려주므로,
+        # 그 값을 저장하면 바가 화면 위 끝에 붙어 버린다. 첫 실행이면
+        # _place_initial이 정한 자리를 앵커로 삼는다. 쓰는 곳은 사용자가
+        # 드래그로 자리를 정하는 _save_pos 한 곳뿐이다.
+        x, y = self._anchor_xy()
         self.cv.configure(width=self._fix_w)
         self.root.geometry(f"{self._fix_w}x{self._fix_h}+{x}+{y}")
-        self.app.cfg["bar_y"] = y
         save_config(self.app.cfg)
         self._last = [None] * (self.LINES * self.MAX_PANELS)
         self.root.update_idletasks()    # 새 geometry가 잡힌 뒤에 배경을 뜬다
@@ -2919,11 +2931,36 @@ class FloatingBar(threading.Thread):
         if self._hwnd:
             u.ShowWindow(ctypes.c_void_p(self._hwnd), 4 if on else 0)
 
+    def _deiconify_in_place(self):
+        """Tk deiconify — 단, 창이 저장된 자리에서 나타나게 한다.
+
+        Tk는 숨어 있는 동안의 위치 요청을 무시하고, 다시 매핑할 때 창(HWND)을
+        새로 만들며 마지막으로 '보이던' 좌표를 쓴다(tkWinWm.c UpdateWrapper).
+        한 번도 보인 적이 없거나 오래 숨어 있었으면 그 좌표가 스테일이라 —
+        부팅 직후엔 0,0 — 바가 화면 왼쪽 위에 잠깐 떴다가 다음 idle에야
+        제자리로 온다(실측: 매 부팅). 그래서 deiconify 직후 새 HWND를 곧바로
+        앵커 좌표로 옮기고 idle까지 돌려, 첫 프레임부터 제자리에 있게 한다.
+        새 HWND는 훅·표시/숨김이 쓰는 캐시에도 바로 반영한다 — 옛 핸들로는
+        ShowWindow가 조용히 실패해 한 틱(0.5초) 동안 명령이 증발했다.
+        """
+        x, y = self._anchor_xy()
+        self.root.geometry(f"+{x}+{y}")
+        self.root.deiconify()
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            self._hwnd = hwnd
+            u.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(0), x, y,
+                           0, 0, 0x0015)      # NOSIZE|NOZORDER|NOACTIVATE
+        except Exception:
+            log.exception("deiconify reposition failed")
+        self.root.update_idletasks()
+
     def _show(self, on):
         """상태가 바뀔 때만 표시/숨김 — 매 틱 재표시로 인한 깜빡임 방지."""
         if on and not self._shown:
             if not self._mapped:
-                self.root.deiconify()   # Tk 상태를 normal로 만드는 건 한 번만
+                self._deiconify_in_place()  # Tk 상태를 normal로 만드는 건 한 번만
                 self._mapped = True
             else:
                 try:
@@ -2931,7 +2968,7 @@ class FloatingBar(threading.Thread):
                         # Win32 숨김을 Tk가 '내려감'으로 기록한 채 남으면 이후
                         # 그리기·이동이 전부 무시된다(2026-08-27 동결 실측) —
                         # 표시할 때마다 상태가 어긋나 있으면 되살린다
-                        self.root.deiconify()
+                        self._deiconify_in_place()
                 except Exception:
                     pass
             self._win_show(True)        # 먼저 띄운다 — 배경 촬영이 복귀를 늦추면 안 된다
@@ -3151,9 +3188,16 @@ class TrayApp:
             os.rename(old, exe)         # 되돌린다
             raise
         log.info("update installed: v%s (exe swap)", ver)
-        # 구 인스턴스가 싱글턴 포트를 놓은 뒤(약 3초) 새 인스턴스를 띄운다
+        # 잠시 뒤 새 인스턴스를 띄운다. 새 인스턴스는 전임이 포트를 놓을
+        # 때까지 스스로 기다리므로(acquire_singleton) 여기 지연은 짧아도 된다.
+        # 예약 작업을 경유해야 다시 그 작업의 인스턴스가 된다 — EXE를 직접
+        # 띄우면 작업은 Ready로 남아, 이후 Claude 세션이 시작될 때마다 훅의
+        # `schtasks /run`이 새 프로세스를 진짜로 만들어 냈다(작업 인스턴스일
+        # 때는 IgnoreNew 정책이 그 호출을 그냥 무시한다). 작업이 없으면
+        # (수동 실행 설치) 전처럼 EXE를 직접 띄운다.
         subprocess.Popen(
-            f'cmd /c ping -n 4 127.0.0.1 >nul & start "" "{exe}"',
+            f'cmd /c ping -n 2 127.0.0.1 >nul & '
+            f'(schtasks /run /tn "{STARTUP_TASK}" >nul 2>&1 || start "" "{exe}")',
             creationflags=0x08000008)   # DETACHED | CREATE_NO_WINDOW
         self.q.put(("quit",))
 
@@ -3639,16 +3683,18 @@ class TrayApp:
                 os.startfile(APPDATA_DIR)
             elif kind == "quit":
                 self.stop_evt.set()
+                release_singleton()     # 후임이 기다리지 않게 포트부터 놓는다
                 icon.stop()
                 return
 
     def _singleton_listener(self):
-        if _singleton_sock is None:
+        s = _singleton_sock         # release_singleton이 전역을 비워도 안전하게
+        if s is None:
             return
-        _singleton_sock.settimeout(1.0)
+        s.settimeout(1.0)
         while not self.stop_evt.is_set():
             try:
-                conn, _ = _singleton_sock.accept()
+                conn, _ = s.accept()
                 conn.close()
                 self.force_api.set()
                 self.wake.set()
@@ -3667,22 +3713,65 @@ class TrayApp:
 _singleton_sock = None
 
 
-def acquire_singleton():
-    global _singleton_sock
+SINGLETON_WAIT_SEC = 8      # 전임이 포트를 놓기를 기다리는 최대 시간
+
+
+def _try_bind_singleton():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", SINGLETON_PORT))
         s.listen(2)
-        _singleton_sock = s
+        return s
     except OSError:
         s.close()
+        return None
+
+
+def acquire_singleton():
+    """한 번에 하나만 — 단, 전임이 종료 중이면 포트가 풀릴 때까지 기다린다.
+
+    자동 업데이트는 새 EXE를 띄우고 구 인스턴스를 종료하는데, 구 인스턴스가
+    포트를 놓기 전에 새 인스턴스가 먼저 도착하면 '이미 떠 있다'고 보고
+    그대로 죽어 위젯이 통째로 사라졌다(재시도 없음). 이제 처음 실패하면
+    기존 인스턴스에 신호를 보낸 뒤 몇 초간 bind를 다시 시도하고, 그래도
+    안 되면 그때 물러난다. 평소 중복 실행(세션 시작 훅)은 신호만 보내고
+    잠시 뒤 조용히 끝나므로 겉보기는 전과 같다.
+    """
+    global _singleton_sock
+    s = _try_bind_singleton()
+    if s is not None:
+        _singleton_sock = s
+        return
+    signalled = False
+    try:
+        c = socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=2)
+        c.close()
+        signalled = True
+    except OSError:
+        pass
+    deadline = time.time() + SINGLETON_WAIT_SEC
+    while time.time() < deadline:
+        time.sleep(0.5)
+        s = _try_bind_singleton()
+        if s is not None:
+            _singleton_sock = s
+            log.info("previous instance released the port - taking over")
+            return
+    if signalled:
+        log.info("already running — signalled existing instance")
+        sys.exit(0)
+    _singleton_sock = None      # 포트를 누가 쥐고 있는지 모른다 — 그냥 뜬다
+
+
+def release_singleton():
+    """종료 절차 맨 앞에서 포트를 놓는다 — 후임이 즉시 자리를 이어받게."""
+    global _singleton_sock
+    s, _singleton_sock = _singleton_sock, None
+    if s is not None:
         try:
-            c = socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=2)
-            c.close()
-            log.info("already running — signalled existing instance")
-            sys.exit(0)
+            s.close()
         except OSError:
-            _singleton_sock = None
+            pass
 
 
 def main():
