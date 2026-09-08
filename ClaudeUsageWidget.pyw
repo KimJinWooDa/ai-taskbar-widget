@@ -30,7 +30,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.17.1"
+__version__ = "3.17.2"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1392,6 +1392,9 @@ class FloatingBar(threading.Thread):
         self._camo_retry = 0        # 거친 조각을 만나 다시 노린 횟수 (상한 5)
         self._rebuild = False       # 동결·배율 변화 감지 — 다음 틱에 창 재생성
         self._strikes = 0           # 동결 의심 연속 횟수 (2회면 재생성)
+        # 이 창에 칠하려 한 배경색들의 파랑 채널 — 동결 판정의 기준점이다
+        # (_health_check). 첫 항목은 첫 촬영 전까지의 임시 배경.
+        self._painted = [int(self.BG[5:7], 16)]
         self._pal = self.PAL_DARK
         self._bgimg = None
         self._probe_warned = False
@@ -1583,6 +1586,7 @@ class FloatingBar(threading.Thread):
             self.cv.configure(bg=solid)
             lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
             self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
+            self._note_painted(rgb[2])
         if not force:
             if self._rgb and \
                     max(abs(a - b) for a, b in zip(rgb, self._rgb)) <= 3:
@@ -1652,6 +1656,7 @@ class FloatingBar(threading.Thread):
             self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
             self._last = [None] * (self.LINES * self.MAX_PANELS)
             self._camo_at = time.time()
+            self._note_painted(b)
             log.info("bar camo #%02x%02x%02x", r, gr, b)
         except Exception:
             log.exception("bg capture failed")
@@ -2812,6 +2817,18 @@ class FloatingBar(threading.Thread):
         self.cv.coords(v, cols[0], y)      # 값은 오른쪽 정렬 — 끝이 맞는다
         self.cv.coords(w, cols[1], y)
 
+    def _note_painted(self, blue):
+        """칠한 배경색의 파랑 채널을 남긴다 — 동결 판정의 기준점.
+
+        비슷한 색은 합치고(±4, 위장색 자체의 무시 폭과 같다) 24개에서 멈춘다.
+        가득 차면 새 색을 버리고 옛 색을 남긴다 — 동결은 시작 직후에 생기고
+        (2026-08-27 실측) 그때 화면에 굳은 색이 기록에서 가장 오래된 축이다.
+        """
+        if any(abs(blue - b) <= 4 for b in self._painted):
+            return
+        if len(self._painted) < 24:
+            self._painted.append(blue)
+
     def _bar_contrast(self, x, y, w, h):
         """바 영역의 밝기 폭 (가장 어두운 값, 가장 밝은 값).
 
@@ -2892,10 +2909,16 @@ class FloatingBar(threading.Thread):
             stuck = span[1] - span[0] < 24
             # 진짜 동결이면 우리가 칠해 둔 배경색이 그대로 남아 보인다.
             # 전혀 다른 색(대개 검정)이면 동결이 아니라 화면을 못 읽은 것 —
-            # 그걸 세면 멀쩡한 바를 부순다. _rgb는 옆 작업표시줄에서 뜬 색.
-            if stuck and self._rgb is not None and                     abs(span[1] - self._rgb[2]) > 24:
-                log.info("screen unreadable (flat %d, bg %d) - not frozen",
-                         span[1], self._rgb[2])
+            # 그걸 세면 멀쩡한 바를 부순다.
+            # 기준은 '마지막으로 요청한 색'이 아니라 '이 창에 칠한 색 전부'다.
+            # 동결은 화면을 옛 색에 굳혀 두는데 위장색은 그 뒤로도 계속 새로
+            # 잡히므로, 마지막 색과만 견주면 동결일수록 어긋나 영영 재생성되지
+            # 않는다 (2026-09-08 실측: 화면은 #e3edf8에 굳은 채 요청색만
+            # #dcdcdc로 바뀌어, 워치독이 내내 "not frozen"만 찍었다).
+            if stuck and not any(abs(span[1] - b) <= 24
+                                 for b in self._painted):
+                log.info("screen unreadable (flat %d, painted %s) - not frozen",
+                         span[1], self._painted)
                 self._strikes = 0
                 return
             self._strikes = self._strikes + 1 if stuck else 0
