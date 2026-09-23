@@ -181,7 +181,7 @@ class WhatsNewTests(unittest.TestCase):
         app = types.SimpleNamespace(cfg=cfg, update_info=None,
                                     _headlines={})
         for name in ("_note_version", "whats_new_view", "mark_whats_new_seen",
-                     "headline_for"):
+                     "range_headline", "whats_new_range"):
             setattr(app, name,
                     types.MethodType(getattr(widget.TrayApp, name), app))
         return app
@@ -234,6 +234,33 @@ class WhatsNewTests(unittest.TestCase):
         self.assertEqual([e["v"] for e in entries], ["3.18.1", "3.18.0"])
         self.assertEqual(sub, "v3.18.1 업데이트 완료")
 
+    def test_unseen_notes_are_chained_not_overwritten(self):
+        # 3.17.1 → 3.18.0 소식을 안 연 채 3.18.1로 올라와도 3.18.0이 남아야 한다
+        app = self._app({"bar_right": 10, "last_run_version": "3.18.0",
+                         "whats_new": {"from": "3.17.1", "to": "3.18.0",
+                                       "at": 1}})
+        with mock.patch.object(widget, "__version__", "3.18.1"):
+            app._note_version()
+        self.assertEqual(app.cfg["whats_new"]["from"], "3.17.1")
+        self.assertEqual(app.cfg["whats_new"]["to"], "3.18.1")
+
+    def test_seen_notes_start_a_new_range(self):
+        app = self._app({"bar_right": 10, "last_run_version": "3.18.0"})
+        with mock.patch.object(widget, "__version__", "3.18.1"):
+            app._note_version()
+        self.assertEqual(app.cfg["whats_new"]["from"], "3.18.0")
+
+    def test_range_headline_prefers_the_biggest_release(self):
+        text = ("## v3.18.1 — b\n- 작은 수정\n\n"
+                "## v3.18.0 — a\n- **큰 기능** 설명\n- 둘\n- 셋\n\n"
+                "## v3.17.2 — z\n- 옛것 하나\n- 옛것 둘\n- 셋\n- 넷\n")
+        app = self._app({})
+        self.assertEqual(app.range_headline((3, 17, 2), (3, 18, 1), text),
+                         "큰 기능")
+        self.assertEqual(app.range_headline((3, 18, 0), (3, 18, 1), text),
+                         "작은 수정")
+        self.assertEqual(app.range_headline((3, 18, 1), (3, 18, 1), text), "")
+
     def test_fresh_install_has_no_whats_new(self):
         app = self._app({})
         self.assertTrue(app._note_version())
@@ -252,7 +279,8 @@ class WhatsNewTests(unittest.TestCase):
         mode, _, entries = app.whats_new_view()
         self.assertEqual(mode, "available")
         self.assertEqual([e["v"] for e in entries], ["3.19.0"])
-        self.assertEqual(app.headline_for("3.19.0", notes), "새 기능")
+        self.assertEqual(app.range_headline((3, 18, 0), (3, 19, 0), notes),
+                         "새 기능")
         app.mark_whats_new_seen(mode)
         self.assertEqual(app.cfg["update_seen"], "3.19.0")
 

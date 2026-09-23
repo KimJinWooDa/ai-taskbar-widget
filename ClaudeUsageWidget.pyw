@@ -31,7 +31,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.18.1"
+__version__ = "3.18.2"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -2042,7 +2042,9 @@ class FloatingBar(threading.Thread):
         press = "트레이 메뉴에서" if self.app.cfg.get("bar_locked") else "눌러서"
         if mode == "available":
             ver = self.app.update_info[0]
-            head = self.app.headline_for(ver, self.app.update_info[1])
+            head = self.app.range_headline(_ver_tuple(__version__),
+                                           _ver_tuple(ver),
+                                           self.app.update_info[1])
             if self.app._updating:
                 hint = "설치 중… 곧 재시작"
             elif self.app.update_error:
@@ -2052,7 +2054,7 @@ class FloatingBar(threading.Thread):
             lines = [("새 버전", f"v{ver}", "", accent, accent, "")]
         else:
             ver = self.app.cfg["whats_new"].get("to") or __version__
-            head = self.app.headline_for(ver)
+            head = self.app.range_headline(*self.app.whats_new_range())
             hint = f"{press} 바뀐 점 보기"
             lines = [("업데이트", f"v{ver}", "", accent, accent, "완료")]
         if head:
@@ -3502,22 +3504,43 @@ class TrayApp:
             return False
         if not fresh and (prev is None
                           or _ver_tuple(prev) < _ver_tuple(__version__)):
-            self.cfg["whats_new"] = {"from": prev, "to": __version__,
+            start = prev
+            pending = self.cfg.get("whats_new")
+            if pending and pending.get("to") == prev:
+                # 지난 업데이트 소식을 아직 안 봤다 — 덮어쓰지 않고 범위를
+                # 이어 붙인다(예: 3.17.2 → 3.18.1을 안 연 채 3.18.2가 오면
+                # 3.18.0부터 전부 보여야 한다)
+                start = pending.get("from")
+            self.cfg["whats_new"] = {"from": start, "to": __version__,
                                      "at": time.time()}
             log.info("updated %s -> %s - whats-new pending",
-                     prev or "?", __version__)
+                     start or "?", __version__)
         self.cfg["last_run_version"] = __version__
         save_config(self.cfg)
         return fresh
 
-    def headline_for(self, ver, notes=None):
-        """그 버전 패치노트의 한 줄 요약 (없으면 ''). 버전별로 한 번만 계산."""
-        if ver not in self._headlines:
+    def range_headline(self, lo, hi, notes=None):
+        """(lo, hi] 사이 패치노트의 한 줄 요약 — 알림과 바 패널이 쓴다.
+
+        여러 버전을 한꺼번에 건너뛰었으면 불릿이 가장 많은(가장 큰 변경이
+        담긴) 버전의 요약을 쓴다. 최신 버전만 보면 작은 수정 한 줄이
+        큰 릴리스를 가려 버린다(3.17.2 → 3.18.1에서 실제로 그랬다).
+        """
+        key = (lo, hi, notes is None)
+        if key not in self._headlines:
             text = notes if notes is not None else local_changelog()
-            item = next((e for e in changelog_entries(text) if e["v"] == ver),
-                        None)
-            self._headlines[ver] = headline(item["items"]) if item else ""
-        return self._headlines[ver]
+            span = [e for e in changelog_entries(text) if lo < e["t"] <= hi]
+            best = max(span, key=lambda e: (len(e["items"]), e["t"]),
+                       default=None)
+            self._headlines[key] = headline(best["items"]) if best else ""
+        return self._headlines[key]
+
+    def whats_new_range(self):
+        """업데이트 소식이 다루는 (이전, 지금) 버전 튜플 — 기록이 없던
+        버전에서 올라왔으면 이전은 UNTRACKED_UNTIL."""
+        wn = self.cfg.get("whats_new") or {}
+        return (_ver_tuple(wn.get("from") or UNTRACKED_UNTIL),
+                _ver_tuple(wn.get("to") or __version__))
 
     def where_to_look(self):
         """토스트가 가리킬 곳 — 잠긴 바는 클릭이 통과하므로 트레이 메뉴를 댄다."""
@@ -3547,8 +3570,7 @@ class TrayApp:
         local = changelog_entries(local_changelog())
         wn = self.cfg.get("whats_new")
         if wn:
-            hi = _ver_tuple(wn.get("to") or __version__)
-            lo = _ver_tuple(wn.get("from") or UNTRACKED_UNTIL)
+            lo, hi = self.whats_new_range()
             entries = [e for e in local if lo < e["t"] <= hi]
             sub = (f"v{wn['from']} → v{wn['to']} 업데이트 완료"
                    if wn.get("from") else f"v{wn['to']} 업데이트 완료")
@@ -3675,7 +3697,7 @@ class TrayApp:
                 log.info("release notes unavailable (%s) - latest only", e)
                 notes = body
             self.update_info = (latest, notes, assets, digests)
-            head = self.headline_for(latest, notes)
+            head = self.range_headline(cur, ver_t, notes)
             if self.cfg.get("auto_update", True):
                 if self._updating:
                     return
@@ -3717,7 +3739,7 @@ class TrayApp:
                                            m.group(0)).group(1)) > cur]
             notes = "\n".join(m.group(0).strip() + "\n" for m in keep)
             self.update_info = (latest, notes, None, None)
-            head = self.headline_for(latest, notes)
+            head = self.range_headline(cur, entries[0]["t"], notes)
         log.info("update ready: v%s (current v%s)", latest, __version__)
         if self.cfg.get("notified_version") != latest:
             self.cfg["notified_version"] = latest
@@ -4185,7 +4207,7 @@ class TrayApp:
                 return
             wn = self.cfg.get("whats_new")
             if wn and wn.get("to") == __version__ and not wn.get("toasted"):
-                head = self.headline_for(__version__)
+                head = self.range_headline(*self.whats_new_range())
                 self.icon.notify(
                     f"v{__version__} 업데이트 완료" + (f" — {head}" if head else "")
                     + f"\n{self.where_to_look()} 바뀐 점을 볼 수 있어요",
