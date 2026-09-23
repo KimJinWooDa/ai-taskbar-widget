@@ -117,6 +117,10 @@ Wait-Process -Name "AI-Skill-Widget" -Timeout 10 -ErrorAction SilentlyContinue
 Wait-Process -Name "SkillEventHook" -Timeout 10 -ErrorAction SilentlyContinue
 Copy-FileWithRetry $widgetSource $widget
 Copy-FileWithRetry $hookSource $hook
+if ($downloadDir) {
+    # 설치본으로 복사를 마친 내려받기 사본(약 28MB)은 남길 이유가 없다
+    Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host "[2/5] Windows 시작 프로그램 등록 (로그온 예약 작업)"
 # 시작프로그램 폴더는 Windows가 수십 초 늦게 실행한다(실측 44초) —
