@@ -33,6 +33,11 @@ jobs:
       - name: 의존성 설치
         run: pip install -r requirements.txt
 
+      # 테스트가 깨진 버전은 릴리스되지 않는다 — 릴리스는 곧 전 사용자
+      # 자동 업데이트라서, 여기가 마지막 관문이다
+      - name: 테스트
+        run: python -m unittest discover -s tests -v
+
       - name: EXE 빌드
         shell: pwsh
         run: .\build.ps1

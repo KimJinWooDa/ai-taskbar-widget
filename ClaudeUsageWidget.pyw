@@ -9,9 +9,10 @@ Claude 사용량 트레이 아이콘 v2 — 시계 옆에 사용률(%)을 항상
 트레이 아이콘 = 가장 한도에 가까운 항목의 %.
 아이콘 클릭 → 항목별 수치와 재설정까지 남은 시간이 메뉴에 표시된다.
 """
+import base64
 import ctypes
 import ctypes.wintypes
-import glob
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.17.2"
+__version__ = "3.18.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -59,11 +60,16 @@ CHANGELOG_URL = f"https://raw.githubusercontent.com/{REPO}/main/CHANGELOG.md"
 CHANGELOG_PAGE = f"https://github.com/{REPO}/blob/main/CHANGELOG.md"
 REPO_ZIP_URL = f"https://github.com/{REPO}/archive/refs/heads/main.zip"
 REPO_ZIP_TOPDIR = "ai-taskbar-widget-main"
-UPDATE_CHECK_SEC = 24 * 3600
+UPDATE_CHECK_SEC = 6 * 3600     # 하루 1번이면 새 버전 소식이 최대 하루 늦었다
 # EXE 배포본의 자동 업데이트 — v* 태그를 푸시하면 GitHub Actions가 빌드해
 # 릴리스에 EXE를 첨부하고(.github/workflows/release.yml), 위젯은 이 API로
 # 최신 릴리스를 확인해 스스로 교체한다.
 RELEASE_API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
+# 여러 버전을 건너뛴 사용자에게 사이의 패치노트를 모두 보여줄 때만 쓴다
+RELEASES_API_URL = f"https://api.github.com/repos/{REPO}/releases?per_page=20"
+# 릴리스 자산은 이 주소로 시작해야만 받는다 (API 응답이 엉뚱한 곳을 가리키면 거부)
+ASSET_URL_PREFIX = f"https://github.com/{REPO}/releases/download/"
+WHATS_NEW_DAYS = 3              # 업데이트 패널을 안 눌러도 이만큼 지나면 바에서 내린다
 WIDGET_ASSET = "AI-Skill-Widget.exe"
 HOOK_ASSET = "SkillEventHook.exe"
 EXE_MIN_BYTES = 5_000_000       # 잘린 다운로드로 교체하는 사고 방지
@@ -165,6 +171,30 @@ CODEX_TAIL_BYTES = 512 * 1024
 CODEX_SCAN_FILES = 8
 CODEX_TAIL_EVENTS = 40              # 창을 다 못 찾았을 때 거슬러 볼 이벤트 수
 CODEX_WINDOW_KEEP_SEC = 900         # 이만큼 응답에서 빠진 창은 없어진 창으로 본다
+
+def jsonl_files(root):
+    """root 아래 모든 .jsonl의 (mtime, 경로). 못 읽는 폴더는 건너뛴다.
+
+    os.scandir은 폴더를 나열할 때 Windows가 이미 준 크기·시각을 그대로
+    돌려줘서 파일마다 stat을 따로 부르지 않는다 — 1,200~1,500개 기준
+    os.walk + getmtime의 약 1/5 CPU다(2026-09-23 실측 37ms → 6ms).
+    """
+    out, stack = [], [root]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.name.endswith(".jsonl"):
+                            out.append((e.stat().st_mtime, e.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return out
+
 
 _codex_cache = (None, None)         # ((최신 파일, mtime), 스냅샷)
 _codex_api_note = None              # 마지막 API 실패 사유 — 바뀔 때만 로그
@@ -292,18 +322,11 @@ def codex_rate_snapshot():
     """
     global _codex_cache
     now = time.time()
-    try:
-        paths = sorted(
-            glob.glob(os.path.join(CODEX_SESS_DIR, "**", "*.jsonl"),
-                      recursive=True),
-            key=os.path.getmtime, reverse=True)[:CODEX_SCAN_FILES]
-        paths = [p for p in paths
-                 if now - os.path.getmtime(p) < CODEX_SNAP_MAX_AGE]
-        if not paths:
-            return None
-        newest = (paths[0], os.path.getmtime(paths[0]))
-    except OSError:
+    found = sorted(jsonl_files(CODEX_SESS_DIR), reverse=True)[:CODEX_SCAN_FILES]
+    paths = [p for m, p in found if now - m < CODEX_SNAP_MAX_AGE]
+    if not paths:
         return None
+    newest = (paths[0], found[0][0])
     if _codex_cache[0] == newest:
         return _codex_cache[1]
     prev = _codex_cache[1]
@@ -445,21 +468,75 @@ def translate_ko(text):
         return ""
 
 
+# 장수 토큰은 config.json에 평문으로 두지 않는다 — Windows 계정에 묶인
+# DPAPI로 잠가 저장한다. '로그 폴더 열기'로 연 폴더를 통째로 보내거나
+# 동기화·백업 도구가 %APPDATA%를 옮겨도 다른 계정·PC에서는 풀리지 않는다.
+TOKEN_ENC_KEY = "setup_token_dpapi"
+_DPAPI_ENTROPY = b"ai-taskbar-widget/setup-token"
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def dpapi(data, protect):
+    """CryptProtectData / CryptUnprotectData (현재 사용자 범위). 실패는 OSError."""
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    buf = ctypes.create_string_buffer(data, len(data))
+    ent = ctypes.create_string_buffer(_DPAPI_ENTROPY, len(_DPAPI_ENTROPY))
+    src = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    salt = _DataBlob(len(_DPAPI_ENTROPY),
+                     ctypes.cast(ent, ctypes.POINTER(ctypes.c_char)))
+    out = _DataBlob()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    # 1 = CRYPTPROTECT_UI_FORBIDDEN — 트레이 앱이 대화상자를 띄우면 안 된다
+    if not fn(ctypes.byref(src), None, ctypes.byref(salt), None, None, 1,
+              ctypes.byref(out)):
+        raise OSError(ctypes.GetLastError(), "DPAPI 실패")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
 def load_config():
     # utf-8-sig: PowerShell류 외부 도구가 BOM을 붙여 저장하면 json.load가
     # 터져 설정 전체(위치·토글)가 기본값으로 날아간다 — 실측된 실패 경로.
     try:
         with open(CONFIG_PATH, encoding="utf-8-sig") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
+    if not isinstance(cfg, dict):
+        return {}
+    enc = cfg.pop(TOKEN_ENC_KEY, None)
+    if enc and not cfg.get("setup_token"):
+        try:
+            cfg["setup_token"] = dpapi(base64.b64decode(enc),
+                                       False).decode("utf-8")
+        except (OSError, ValueError):
+            # 다른 계정·PC에서 옮겨 온 설정 — 이 계정으로는 못 푼다
+            log.warning("stored setup token could not be decrypted - ignored")
+    return cfg
 
 
 def save_config(cfg):
+    """메모리의 설정(평문 토큰 포함)을 디스크에 — 토큰만 DPAPI로 잠근다."""
+    data = dict(cfg)
+    tok = data.pop("setup_token", None)
+    if tok:
+        try:
+            data[TOKEN_ENC_KEY] = base64.b64encode(
+                dpapi(str(tok).encode("utf-8"), True)).decode("ascii")
+        except OSError:
+            data["setup_token"] = tok   # DPAPI를 못 쓰는 환경 — 예전 방식 유지
     try:
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f)
+            json.dump(data, f)
         os.replace(tmp, CONFIG_PATH)
     except OSError:
         pass
@@ -747,9 +824,6 @@ def fetch_usage_api(cfg=None):
 
 
 # ---------------------------------------------------------------- 업데이트
-_CHANGELOG_HEAD = re.compile(r"^##\s+v?(\d+(?:\.\d+)*)\b")
-
-
 def _ver_tuple(s):
     """'2.7.0' → (2, 7, 0). 자릿수가 달라도 비교되게 3자리로 맞춘다."""
     try:
@@ -759,18 +833,6 @@ def _ver_tuple(s):
     return tuple((nums + [0, 0, 0])[:3])
 
 
-def parse_changelog(text):
-    """CHANGELOG.md → [(버전튜플, '2.7.0', 본문)] 파일 순서(최신이 먼저)."""
-    entries = []
-    for line in text.splitlines():
-        m = _CHANGELOG_HEAD.match(line.strip())
-        if m:
-            entries.append([_ver_tuple(m.group(1)), m.group(1), []])
-        elif entries and line.strip():
-            entries[-1][2].append(line.rstrip())
-    return [(t, s, "\n".join(body)) for t, s, body in entries]
-
-
 def fetch_changelog():
     req = urllib.request.Request(CHANGELOG_URL, headers={"User-Agent": CLI_UA})
     with urllib.request.urlopen(req, timeout=15) as r:
@@ -778,22 +840,32 @@ def fetch_changelog():
 
 
 def parse_release(text):
-    """releases/latest 응답 → (버전튜플, '3.16.0', 패치노트, {파일명: url}).
+    """releases/latest 응답 →
+    (버전튜플, '3.16.0', 패치노트, {파일명: url}, {파일명: sha256 hex}).
 
     태그가 v3.16.0 꼴이 아니면(프리릴리스 실험 태그 등) None — 엉뚱한
-    태그로 자동 교체가 돌면 안 된다.
+    태그로 자동 교체가 돌면 안 된다. sha256은 GitHub가 자산마다 계산해
+    주는 digest("sha256:…")이고, 없는 자산은 사전에서 빠진다.
     """
     try:
         data = json.loads(text)
     except ValueError:
         return None
+    if not isinstance(data, dict):
+        return None
     tag = str(data.get("tag_name") or "").lstrip("vV").strip()
     if not re.fullmatch(r"\d+(?:\.\d+)*", tag):
         return None
-    assets = {a.get("name"): a.get("browser_download_url")
-              for a in data.get("assets") or []
-              if a.get("name") and a.get("browser_download_url")}
-    return _ver_tuple(tag), tag, str(data.get("body") or ""), assets
+    assets, digests = {}, {}
+    for a in data.get("assets") or []:
+        name, url = a.get("name"), a.get("browser_download_url")
+        if not name or not url:
+            continue
+        assets[name] = url
+        digest = str(a.get("digest") or "")
+        if re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+            digests[name] = digest[7:].lower()
+    return _ver_tuple(tag), tag, str(data.get("body") or ""), assets, digests
 
 
 def fetch_latest_release():
@@ -804,14 +876,129 @@ def fetch_latest_release():
         return parse_release(r.read().decode("utf-8", "replace"))
 
 
-def download_file(url, dst):
+def release_notes_between(text, cur_t, latest_t):
+    """releases 목록 응답에서 (지금, 최신] 사이 버전들의 패치노트 — 최신이 먼저.
+
+    본문은 릴리스 워크플로가 CHANGELOG에서 잘라 넣은 `## v… — 날짜` 절이라
+    이어 붙이면 그대로 CHANGELOG 형식이 된다.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return ""
+    parts = []
+    for rel in data if isinstance(data, list) else []:
+        if not isinstance(rel, dict) or rel.get("draft") or rel.get("prerelease"):
+            continue
+        tag = str(rel.get("tag_name") or "").lstrip("vV").strip()
+        if not re.fullmatch(r"\d+(?:\.\d+)*", tag):
+            continue
+        ver_t = _ver_tuple(tag)
+        if cur_t < ver_t <= latest_t:
+            parts.append((ver_t, str(rel.get("body") or "").strip()))
+    parts.sort(reverse=True)
+    return "\n\n".join(body for _, body in parts if body)
+
+
+def fetch_release_notes(cur_t, latest_t):
+    req = urllib.request.Request(RELEASES_API_URL, headers={"User-Agent": CLI_UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return release_notes_between(r.read().decode("utf-8", "replace"),
+                                     cur_t, latest_t)
+
+
+def trusted_asset_url(url):
+    """이 저장소 릴리스의 다운로드 주소인가 — 아니면 받지 않는다.
+
+    배포 전 검증용 오버라이드(CLAUDE_WIDGET_RELEASE_API)를 켠 동안만
+    가짜 릴리스가 가리키는 임의 주소를 허용한다.
+    """
+    if os.environ.get("CLAUDE_WIDGET_RELEASE_API"):
+        return str(url).startswith(("https://", "http://127.0.0.1"))
+    return str(url).startswith(ASSET_URL_PREFIX)
+
+
+def download_file(url, dst, sha256=None):
+    """url → dst. sha256을 주면 받은 내용이 그 값과 같을 때만 남긴다.
+
+    크기·MZ 검사(check_exe)는 잘린 다운로드만 잡는다. 중간에 바뀐 파일은
+    GitHub가 릴리스 자산마다 주는 SHA-256과 맞춰 봐야 걸러진다.
+    실패하면 반쯤 받은 파일을 지운다 — 다음 교체 단계로 넘어가지 않게.
+    """
+    if not trusted_asset_url(url):
+        raise RuntimeError(f"신뢰할 수 없는 다운로드 주소: {url}")
     req = urllib.request.Request(url, headers={"User-Agent": CLI_UA})
-    with urllib.request.urlopen(req, timeout=120) as r, open(dst, "wb") as f:
-        while True:
-            chunk = r.read(256 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
+    h = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, \
+                open(dst, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+        if sha256 and h.hexdigest() != sha256.lower():
+            raise RuntimeError("SHA-256 불일치 — 손상됐거나 바뀐 파일이라 "
+                               "설치하지 않았습니다")
+    except BaseException:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise
+
+
+def local_changelog():
+    """이 실행본에 딸린 CHANGELOG.md — EXE는 빌드 때 함께 묶는다(build.ps1).
+
+    업데이트 직후 "무엇이 바뀌었나"를 네트워크 없이 정확히 이 버전 기준으로
+    보여주기 위해서다. 못 읽으면 ''.
+    """
+    base = getattr(sys, "_MEIPASS", None) or \
+        os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(base, "CHANGELOG.md"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+_CHANGELOG_FULLHEAD = re.compile(
+    r"^##\s+v?(\d+(?:\.\d+)*)\b\s*(?:[—–-]\s*(\S+))?")
+
+
+def changelog_entries(text):
+    """CHANGELOG 형식 → [{'t','v','date','items'}] 파일 순서(최신이 먼저).
+
+    items는 불릿 하나가 문자열 하나 — 들여쓴 이어지는 줄은 그 불릿에 붙인다.
+    """
+    entries = []
+    for line in text.splitlines():
+        s = line.strip()
+        m = _CHANGELOG_FULLHEAD.match(s)
+        if m:
+            entries.append({"t": _ver_tuple(m.group(1)), "v": m.group(1),
+                            "date": m.group(2) or "", "items": []})
+        elif entries and s and not s.startswith("#"):
+            items = entries[-1]["items"]
+            if s.startswith(("- ", "* ")):
+                items.append(s[2:].strip())
+            elif items:
+                items[-1] += " " + s
+            else:
+                items.append(s)
+    return entries
+
+
+def headline(items):
+    """패치노트의 한 줄 요약 — 첫 불릿의 굵은 글씨, 없으면 첫 불릿 앞부분."""
+    if not items:
+        return ""
+    m = re.search(r"\*\*(.+?)\*\*", items[0])
+    text = m.group(1) if m else re.sub(r"[*`]", "", items[0])
+    text = text.strip().rstrip(".")
+    return text if len(text) <= 60 else text[:58] + "…"
 
 
 def check_exe(path):
@@ -863,12 +1050,6 @@ def download_repo(dst):
     if not os.path.exists(os.path.join(src, "ClaudeUsageWidget.pyw")):
         raise RuntimeError("내려받은 압축에 위젯 파일이 없음")
     return src
-
-
-def _msgbox(text, title, flags):
-    # MB_TOPMOST | MB_SETFOREGROUND — 트레이에서 띄우는 창이 뒤로 숨지 않게
-    return ctypes.windll.user32.MessageBoxW(0, text, title,
-                                            flags | 0x40000 | 0x10000)
 
 
 # ---------------------------------------------------------------- 자동 실행
@@ -1022,19 +1203,9 @@ def latest_transcript_mtime():
             best_path = None
     if best_path is None or now - _ts_cache["scan_at"] >= 60:
         _ts_cache["scan_at"] = now
-        try:
-            for root, dirs, files in os.walk(TRANSCRIPT_DIR):
-                for f in files:
-                    if f.endswith(".jsonl"):
-                        p = os.path.join(root, f)
-                        try:
-                            m = os.path.getmtime(p)
-                        except OSError:
-                            continue
-                        if m > best_m:
-                            best_m, best_path = m, p
-        except OSError:
-            pass
+        for m, p in jsonl_files(TRANSCRIPT_DIR):
+            if m > best_m:
+                best_m, best_path = m, p
         _ts_cache["path"] = best_path
     return best_m
 
@@ -1307,9 +1478,10 @@ class FloatingBar(threading.Thread):
     """
 
     LINES = 3               # 작업표시줄 48px에 12px 줄 3개 + 여백 6px
-    MAX_PANELS = 3          # 루틴 알림 + Codex 사용량 + Claude 사용량
+    MAX_PANELS = 4          # 업데이트 + 루틴 알림 + Codex 사용량 + Claude 사용량
     PANEL_GAP = 20
-    ACCENTS = {"claude": "#d97757", "codex": "#45a79a", "notify": "#c58a1a"}
+    ACCENTS = {"claude": "#d97757", "codex": "#45a79a", "notify": "#c58a1a",
+               "update": "#4f86e8"}
     FONT_PX = -10           # 음수 = 픽셀 지정. 8pt(11px)에서 한 단계만 줄인 값
     PAD = 8                 # 좌우 여백 — 모든 줄의 라벨이 여기서 시작한다
     TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
@@ -1403,6 +1575,10 @@ class FloatingBar(threading.Thread):
         self._panel_kinds = ["usage"]
         self._details = None
         self._notes = None      # 루틴 알림 목록 창
+        self._whats = None      # 업데이트 소식 창
+        self._whats_mode = None
+        self._whats_status = None
+        self._whats_btn = None
         self._detail_tree = None
         self._detail_summary = None
         self._detail_filter = "all"     # 전체 / claude / codex
@@ -1783,9 +1959,13 @@ class FloatingBar(threading.Thread):
         if self.app.cfg.get("bar_locked") or not hasattr(self, "_dx"):
             return
         if not self._dragged:
-            # 알림 패널을 눌렀으면 알림 목록, 그 밖은 기존대로 스킬 내역
-            if self._panel_kind_at(e.x_root - self.root.winfo_x()) == "notify":
+            # 알림 패널은 알림 목록, 업데이트 패널은 업데이트 소식, 그 밖은
+            # 기존대로 스킬 내역
+            kind = self._panel_kind_at(e.x_root - self.root.winfo_x())
+            if kind == "notify":
                 self._toggle_notifications()
+            elif kind == "update":
+                self._toggle_whats_new()
             else:
                 self._toggle_details()
             return
@@ -1798,13 +1978,69 @@ class FloatingBar(threading.Thread):
         # 알림 패널 위에서의 우클릭은 "확인했다" — 목록을 열지 않고 그 자리에서
         # 읽음 처리하고, 다음 틱에 패널이 사라진다. 창을 여닫는 수고 없이 끄는
         # 길이 없어서 알림이 계속 남아 있다는 신고가 있었다.
-        if self._panel_kind_at(e.x_root - self.root.winfo_x()) == "notify":
+        kind = self._panel_kind_at(e.x_root - self.root.winfo_x())
+        if kind == "notify":
             self.app.notifications.mark_all_read()
             log.info("alerts marked read (right-click)")
+            return
+        if kind == "update":            # 같은 규칙 — 우클릭은 "봤다"
+            self.app.mark_whats_new_seen(self._update_mode())
+            log.info("update panel dismissed (right-click)")
             return
         self.app.cfg["bar_visible"] = False
         save_config(self.app.cfg)
         self._show(False)
+
+    def _update_mode(self):
+        """바의 업데이트 패널이 알리는 것 — 'available' · 'installed' · None.
+
+        설치할 새 버전이 있고 아직 그 소식을 안 열어 봤으면 'available',
+        방금 업데이트됐는데 바뀐 점을 아직 안 봤으면(WHATS_NEW_DAYS까지)
+        'installed'. 설치 중에는 패널을 내리지 않는다 — 곧 재시작한다.
+        """
+        app = self.app
+        info = app.update_info
+        if info and (app.cfg.get("update_seen") != info[0] or app._updating):
+            return "available"
+        wn = app.cfg.get("whats_new")
+        if wn and time.time() - (wn.get("at") or 0) < WHATS_NEW_DAYS * 86400:
+            return "installed"
+        return None
+
+    def _update_panel(self):
+        """업데이트 소식 — 알릴 게 있을 때만 생기고, 누르면 패치노트 창.
+
+        루틴 알림과 같은 규칙: 평소에는 흔적이 없고, 열어 보거나 우클릭하면
+        다음 틱에 사라진다.
+        """
+        mode = self._update_mode()
+        if mode is None:
+            return None
+        accent = self.ACCENTS["update"]
+        # 잠긴 바는 클릭이 통과한다 — 누르라는 안내 대신 트레이 메뉴를 가리킨다
+        press = "트레이 메뉴에서" if self.app.cfg.get("bar_locked") else "눌러서"
+        if mode == "available":
+            ver = self.app.update_info[0]
+            head = self.app.headline_for(ver, self.app.update_info[1])
+            if self.app._updating:
+                hint = "설치 중… 곧 재시작"
+            elif self.app.update_error:
+                hint = f"설치 실패 · {press} 다시 시도"
+            else:
+                hint = f"{press} 바뀐 점 보기·설치"
+            lines = [("새 버전", f"v{ver}", "", accent, accent, "")]
+        else:
+            ver = self.app.cfg["whats_new"].get("to") or __version__
+            head = self.app.headline_for(ver)
+            hint = f"{press} 바뀐 점 보기"
+            lines = [("업데이트", f"v{ver}", "", accent, accent, "완료")]
+        if head:
+            lines.append((head if len(head) <= 22 else head[:21] + "…",
+                          "", "", None, None, ""))
+        lines.append((hint, "", "", None, None, ""))
+        while len(lines) < self.LINES:
+            lines.append(("", "", "", None, None, ""))
+        return {"width": self._panel_width(lines), "lines": lines}
 
     def _notify_panel(self):
         """루틴(예약 작업) 알림 — 안 읽은 게 없으면 패널을 아예 만들지 않는다.
@@ -1921,6 +2157,11 @@ class FloatingBar(threading.Thread):
         넘게 없을 때만 빠진다.
         """
         panels, kinds = [], []
+        # 업데이트 소식은 가장 드물게 나타났다 사라지므로 맨 왼쪽
+        update = self._update_panel()
+        if update:
+            panels.append(update)
+            kinds.append("update")
         notify = self._notify_panel()
         if notify:
             panels.append(notify)
@@ -2180,6 +2421,180 @@ class FloatingBar(threading.Thread):
             messagebox.showerror("루틴 알림 — 실행 실패",
                                  f"열지 못했습니다.\n\n{path}\n\n{e}",
                                  parent=self._notes)
+
+    def _toggle_whats_new(self):
+        if self._whats is not None:
+            try:
+                if self._whats.winfo_exists():
+                    self._whats.destroy()
+                    self._whats = None
+                    return
+            except Exception:
+                pass
+            self._whats = None
+        self._open_whats_new()
+
+    def _open_whats_new(self):
+        """업데이트 소식 창 — 버전별 패치노트 카드, 필요하면 [지금 설치].
+
+        세 가지로 열린다: 설치할 새 버전이 있을 때(그 사이 패치노트 +
+        [지금 설치]), 방금 업데이트됐을 때(이전 → 지금 사이 패치노트),
+        메뉴로 열었을 때(최근 변경 내용). 여는 순간 '봤다'로 처리돼 바의
+        업데이트 패널이 내려간다. 패치노트는 EXE에 묶인 CHANGELOG에서
+        읽으므로 업데이트 직후 오프라인이어도 보인다.
+        """
+        import tkinter as tk
+        import webbrowser
+
+        mode, subtitle, entries = self.app.whats_new_view()
+        self._whats_mode = mode
+        win = self._whats = tk.Toplevel(self.root)
+        win.title("업데이트 소식")
+        win.overrideredirect(True)
+        win.configure(bg="#f4f5f7", highlightbackground="#d9dce1",
+                      highlightthickness=1)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+
+        width, height = self._px(560), self._px(460)
+        x = max(8, min(self.root.winfo_x() + self._fix_w - width,
+                       self.root.winfo_screenwidth() - width - 8))
+        y = max(8, self.root.winfo_y() - height - 10)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+
+        head = tk.Frame(win, bg="#ffffff", height=54)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        tk.Label(head, text="What's New", bg="#ffffff", fg="#202124",
+                 font=("Segoe UI Semibold", 14)).pack(side="left", padx=(18, 8))
+        tk.Label(head, text=subtitle, bg="#ffffff", fg="#6b7280",
+                 font=("맑은 고딕", 9)).pack(side="left", pady=(3, 0))
+        tk.Button(head, text="×", command=self._toggle_whats_new,
+                  relief="flat", borderwidth=0, bg="#ffffff",
+                  activebackground="#eeeeee", fg="#6b7280",
+                  font=("Segoe UI", 15), cursor="hand2"
+                  ).pack(side="right", padx=(0, 14))
+
+        # 바닥 줄을 먼저 붙여야 본문이 늘어나도 버튼이 밀려나지 않는다
+        foot = tk.Frame(win, bg="#f4f5f7")
+        foot.pack(side="bottom", fill="x", padx=18, pady=(0, 12))
+        tk.Button(foot, text="전체 패치 이력", relief="flat", borderwidth=0,
+                  bg="#e9ebee", activebackground="#dfe2e6", fg="#374151",
+                  font=("맑은 고딕", 8), cursor="hand2", padx=10, pady=3,
+                  command=lambda: webbrowser.open(CHANGELOG_PAGE)
+                  ).pack(side="left")
+        self._whats_btn = None
+        if mode == "available":
+            if self.app.update_method() == "git":
+                tk.Label(foot, text="개발 폴더(git)에서 실행 중 — git pull 로 "
+                                    "업데이트하세요", bg="#f4f5f7",
+                         fg="#6b7280", font=("맑은 고딕", 8)
+                         ).pack(side="right")
+            else:
+                self._whats_btn = tk.Button(
+                    foot, text="지금 설치", relief="flat", borderwidth=0,
+                    bg="#1a56c4", activebackground="#174ea6", fg="#ffffff",
+                    activeforeground="#ffffff", font=("맑은 고딕", 9, "bold"),
+                    cursor="hand2", padx=14, pady=3,
+                    command=self._install_from_whats_new)
+                self._whats_btn.pack(side="right")
+        self._whats_status = tk.Label(win, text="", bg="#f4f5f7",
+                                      fg="#b42318", font=("맑은 고딕", 8),
+                                      wraplength=width - 40, justify="left")
+        self._whats_status.pack(side="bottom", anchor="w", padx=18,
+                                pady=(0, 4))
+
+        body = tk.Frame(win, bg="#f4f5f7")
+        body.pack(fill="both", expand=True, padx=18, pady=(10, 8))
+        bar = tk.Scrollbar(body, orient="vertical")
+        bar.pack(side="right", fill="y")
+        txt = tk.Text(body, wrap="word", bg="#ffffff", fg="#4b5158",
+                      relief="flat", borderwidth=0, highlightthickness=1,
+                      highlightbackground="#e3e6ea", padx=14, pady=10,
+                      font=("맑은 고딕", 9), cursor="arrow",
+                      spacing1=2, spacing3=3, yscrollcommand=bar.set)
+        txt.pack(side="left", fill="both", expand=True)
+        bar.configure(command=txt.yview)
+        txt.tag_configure("ver", font=("Segoe UI Semibold", 12),
+                          foreground="#202124", spacing1=8)
+        txt.tag_configure("date", font=("맑은 고딕", 8), foreground="#8a9099")
+        txt.tag_configure("item", lmargin1=4, lmargin2=18, spacing1=4)
+        txt.tag_configure("b", font=("맑은 고딕", 9, "bold"),
+                          foreground="#202124")
+        txt.tag_configure("code", font=("Consolas", 9), background="#f1f3f5")
+        if not entries:
+            txt.insert("end", "패치노트를 불러오지 못했습니다 — 아래 '전체 패치 "
+                              "이력'에서 볼 수 있어요.")
+        for i, e in enumerate(entries):
+            if i:
+                txt.insert("end", "\n")
+            txt.insert("end", f"v{e['v']}", "ver")
+            if e["date"]:
+                txt.insert("end", f"   {e['date']}", "date")
+            txt.insert("end", "\n")
+            for item in e["items"]:
+                txt.insert("end", "•  ", "item")
+                # **굵게** 와 `코드`만 살리고 나머지 마크다운은 그대로 둔다
+                for part in re.split(r"(\*\*.+?\*\*|`[^`]+`)", item):
+                    if part.startswith("**") and part.endswith("**"):
+                        txt.insert("end", part[2:-2].replace("`", ""),
+                                   ("item", "b"))
+                    elif part.startswith("`") and part.endswith("`"):
+                        txt.insert("end", part[1:-1], ("item", "code"))
+                    elif part:
+                        txt.insert("end", part, "item")
+                txt.insert("end", "\n", "item")
+        txt.configure(state="disabled")
+        win.bind_all("<MouseWheel>", lambda ev: txt.yview_scroll(
+            -1 if ev.delta > 0 else 1, "units"))
+        win.bind("<Destroy>", lambda ev: (
+            win.unbind_all("<MouseWheel>") if ev.widget is win else None))
+        win.bind("<Escape>", lambda ev: self._toggle_whats_new())
+        self._refresh_whats_new()
+        self.app.mark_whats_new_seen(mode)
+        log.info("whats-new opened (%s, %d entries)", mode, len(entries))
+
+    def _install_from_whats_new(self):
+        """[지금 설치] — 누른 것이 곧 확인이다. 진행 상황은 틱이 창에 그린다."""
+        if self.app._updating:
+            return
+        self.app.update_error = None
+        self.app.q.put(("update_now",))
+        if self._whats_btn is not None:
+            self._whats_btn.configure(state="disabled", text="설치 중…")
+        if self._whats_status is not None:
+            self._whats_status.configure(
+                fg="#1a56c4", text="새 버전을 받는 중입니다 — 끝나면 위젯이 "
+                                   "스스로 다시 시작합니다.")
+
+    def _refresh_whats_new(self):
+        """열린 업데이트 창의 설치 상태 줄 — 설치 중/실패와 다시 시도 안내."""
+        if self._whats is None:
+            return
+        try:
+            if not self._whats.winfo_exists():
+                self._whats = None
+                return
+        except Exception:
+            self._whats = None
+            return
+        err, busy = self.app.update_error, self.app._updating
+        if self._whats_btn is not None:
+            want = ("disabled", "설치 중…") if busy else \
+                ("normal", "다시 시도" if err else "지금 설치")
+            if (str(self._whats_btn.cget("state")),
+                    self._whats_btn.cget("text")) != want:
+                self._whats_btn.configure(state=want[0], text=want[1])
+        if self._whats_status is not None and err and not busy:
+            text = (f"설치하지 못했습니다: {err}\n다시 시도해도 안 되면 "
+                    "저장소 폴더의 install.cmd를 다시 실행하세요 — 설정과 "
+                    "기록은 그대로 남습니다.")
+            if self._whats_status.cget("text") != text:
+                self._whats_status.configure(fg="#b42318", text=text)
 
     def _toggle_details(self):
         if self._details is not None:
@@ -2709,6 +3124,10 @@ class FloatingBar(threading.Thread):
         if self.app.notes_requested.is_set():
             self.app.notes_requested.clear()
             self._toggle_notifications()
+        if self.app.whats_new_requested.is_set():
+            self.app.whats_new_requested.clear()
+            self._toggle_whats_new()
+        self._refresh_whats_new()
         if not self.app.cfg.get("bar_visible", True):
             self._show(False)
             return
@@ -3020,8 +3439,12 @@ class TrayApp:
         self.updated_at = None
         self.status = "불러오는 중…"
         self.auth_notice = None     # 토큰 만료 시 플로팅 바에 띄울 문구
-        self.update_info = None     # (새 버전 문자열, 패치노트) — 있으면 메뉴에 표시
+        # (새 버전, 패치노트(CHANGELOG 형식), {자산: url}, {자산: sha256})
+        # — 있으면 바의 업데이트 패널·메뉴에 뜬다
+        self.update_info = None
+        self.update_error = None    # 마지막 설치 실패 사유 — 업데이트 창이 보여준다
         self._updating = False
+        self._headlines = {}        # 버전 → 한 줄 요약 (바가 0.5초마다 묻는다)
         self.icon = None
         self.cfg = load_config()
         self.skill_tracker = TrackerService()
@@ -3029,14 +3452,98 @@ class TrayApp:
         self.notifications = NotificationService()
         self.notes_requested = threading.Event()
         self.details_requested = threading.Event()
+        self.whats_new_requested = threading.Event()
         if os.environ.get("SKILL_WIDGET_SHOW_DETAILS") == "1":
             self.details_requested.set()
         if os.environ.get("SKILL_WIDGET_SHOW_ALERTS") == "1":
             self.notes_requested.set()
+        if os.environ.get("SKILL_WIDGET_SHOW_WHATSNEW") == "1":
+            self.whats_new_requested.set()
+        self._fresh_install = self._note_version()
 
         self._load_file(initial=True)   # 켜자마자 마지막 값 표시
         if not self.rows:
             self._load_cache()          # 훅 데이터가 없으면 지난 실행의 API 값
+
+    def _note_version(self):
+        """이번 실행이 업데이트 직후인지 기록한다. 새로 설치된 거면 True.
+
+        업데이트(자동이든 수동이든) 뒤 첫 실행이면 cfg["whats_new"]에
+        (이전 → 지금) 버전을 남긴다 — 바에 '업데이트' 패널이 뜨고, 누르면
+        그 사이 패치노트를 보여준다. 설정이 아예 없으면 첫 설치라 남기지 않는다.
+        평문으로 남아 있던 장수 토큰도 이때 한 번 DPAPI로 다시 저장된다.
+        """
+        prev = self.cfg.get("last_run_version")
+        fresh = not self.cfg
+        if prev == __version__:
+            if self.cfg.get("setup_token"):
+                save_config(self.cfg)   # 옛 평문 토큰 → DPAPI (멱등)
+            return False
+        if not fresh and (prev is None
+                          or _ver_tuple(prev) < _ver_tuple(__version__)):
+            self.cfg["whats_new"] = {"from": prev, "to": __version__,
+                                     "at": time.time()}
+            log.info("updated %s -> %s - whats-new pending",
+                     prev or "?", __version__)
+        self.cfg["last_run_version"] = __version__
+        save_config(self.cfg)
+        return fresh
+
+    def headline_for(self, ver, notes=None):
+        """그 버전 패치노트의 한 줄 요약 (없으면 ''). 버전별로 한 번만 계산."""
+        if ver not in self._headlines:
+            text = notes if notes is not None else local_changelog()
+            item = next((e for e in changelog_entries(text) if e["v"] == ver),
+                        None)
+            self._headlines[ver] = headline(item["items"]) if item else ""
+        return self._headlines[ver]
+
+    def where_to_look(self):
+        """토스트가 가리킬 곳 — 잠긴 바는 클릭이 통과하므로 트레이 메뉴를 댄다."""
+        if self.cfg.get("bar_locked") or not self.cfg.get("bar_visible", True):
+            return "트레이 메뉴 '업데이트 소식 보기'에서"
+        return "바의 '업데이트' 패널을 누르면"
+
+    def update_method(self):
+        """'exe'(릴리스 EXE로 교체) · 'git'(개발 폴더 — git pull 안내) · 'zip'."""
+        if getattr(sys, "frozen", False):
+            return "exe"
+        here = os.path.dirname(os.path.abspath(__file__))
+        return "git" if os.path.isdir(os.path.join(here, ".git")) else "zip"
+
+    def whats_new_view(self):
+        """업데이트 창에 그릴 것 — (모드, 부제, 항목들).
+
+        모드: 'available'(설치 대기 — [지금 설치]) · 'installed'(방금 업데이트
+        됨) · 'history'(메뉴로 연 최근 변경 내용).
+        """
+        cur = _ver_tuple(__version__)
+        info = self.update_info
+        if info:
+            entries = [e for e in changelog_entries(info[1]) if e["t"] > cur]
+            return ("available", f"새 버전 v{info[0]} · 지금 v{__version__}",
+                    entries)
+        local = changelog_entries(local_changelog())
+        wn = self.cfg.get("whats_new")
+        if wn:
+            hi = _ver_tuple(wn.get("to") or __version__)
+            lo = _ver_tuple(wn["from"]) if wn.get("from") else None
+            entries = [e for e in local if e["t"] <= hi
+                       and (e["t"] > lo if lo else e["t"] == hi)]
+            sub = (f"v{wn['from']} → v{wn['to']} 업데이트 완료"
+                   if wn.get("from") else f"v{wn['to']} 업데이트 완료")
+            return "installed", sub, entries
+        return ("history", f"최근 변경 내용 · 지금 v{__version__}",
+                [e for e in local if e["t"] <= cur][:6])
+
+    def mark_whats_new_seen(self, mode):
+        """창을 열었다 = 봤다. 바의 업데이트 패널이 다음 틱에 내려간다."""
+        if mode == "installed" and self.cfg.pop("whats_new", None):
+            save_config(self.cfg)
+        elif mode == "available" and self.update_info and \
+                self.cfg.get("update_seen") != self.update_info[0]:
+            self.cfg["update_seen"] = self.update_info[0]
+            save_config(self.cfg)
 
     # ---------------- 데이터
     def _load_file(self, initial=False):
@@ -3133,50 +3640,76 @@ class TrayApp:
             rel = fetch_latest_release()
             if not rel:
                 return
-            ver_t, latest, notes, assets = rel
+            ver_t, latest, body, assets, digests = rel
             if ver_t <= cur or not assets.get(WIDGET_ASSET):
                 self.update_info = None
+                self.update_error = None
                 return
             log.info("update available: v%s (current v%s)",
                      latest, __version__)
+            # 여러 버전을 건너뛰었으면 그 사이 패치노트를 다 모은다 —
+            # 못 모으면 최신 릴리스 본문 하나로 대신한다
+            try:
+                notes = fetch_release_notes(cur, ver_t) or body
+            except Exception as e:
+                log.info("release notes unavailable (%s) - latest only", e)
+                notes = body
+            self.update_info = (latest, notes, assets, digests)
+            head = self.headline_for(latest, notes)
             if self.cfg.get("auto_update", True):
                 if self._updating:
                     return
                 self._updating = True
+                self.update_error = None
                 try:
                     if self.icon:
                         self.icon.notify(
-                            f"새 버전 v{latest} 설치 중 — 잠시 후 재시작합니다",
+                            f"새 버전 v{latest} 설치 중 — 잠시 후 재시작합니다"
+                            + (f"\n{head}" if head else ""),
                             "Claude 위젯 업데이트")
-                    self._install_release(latest, assets)
+                    self._install_release(latest, assets, digests)
                     return
-                except Exception:
-                    # 자동 설치 실패 — 다음 줄부터의 알림·메뉴 경로로 넘긴다
+                except Exception as e:
+                    # 자동 설치 실패 — 바의 업데이트 패널에서 다시 시도하게 한다
                     log.exception("auto update failed")
                     self._updating = False
+                    self.update_error = str(e)
+                    self.cfg.pop("update_seen", None)   # 패널을 다시 띄운다
+                    save_config(self.cfg)
+                    if self.icon:
+                        self.icon.notify(
+                            f"v{latest} 자동 설치 실패 — {self.where_to_look()} "
+                            "다시 시도할 수 있어요",
+                            "Claude 위젯 업데이트")
+                    return
         else:
-            entries = parse_changelog(fetch_changelog())
+            text = fetch_changelog()
+            entries = changelog_entries(text)
             if not entries:
                 return
-            if entries[0][0] <= cur:
+            if entries[0]["t"] <= cur:
                 self.update_info = None
                 return
-            latest = entries[0][1]
-            notes = "\n\n".join(f"v{s}\n{body}" for t, s, body in entries
-                                if t > cur)
-            assets = None
-        self.update_info = (latest, notes, assets)
-        log.info("update menu ready: v%s (current v%s)", latest, __version__)
+            latest = entries[0]["v"]
+            # 개발 실행은 원격 CHANGELOG에서 (지금, 최신] 절만 잘라 쓴다
+            keep = [m for m in re.finditer(r"(?ms)^## v.+?(?=^## v|\Z)", text)
+                    if _ver_tuple(re.match(r"## v?([\d.]+)",
+                                           m.group(0)).group(1)) > cur]
+            notes = "\n".join(m.group(0).strip() + "\n" for m in keep)
+            self.update_info = (latest, notes, None, None)
+            head = self.headline_for(latest, notes)
+        log.info("update ready: v%s (current v%s)", latest, __version__)
         if self.cfg.get("notified_version") != latest:
             self.cfg["notified_version"] = latest
             save_config(self.cfg)
             if self.icon:
-                self.icon.notify(f"새 버전 v{latest}가 나왔습니다 — "
-                                 "트레이 메뉴에서 설치할 수 있습니다",
-                                 "Claude 위젯 업데이트")
+                self.icon.notify(
+                    f"새 버전 v{latest}" + (f" — {head}" if head else "")
+                    + f"\n{self.where_to_look()} 바뀐 점을 보고 설치할 수 있어요",
+                    "Claude 위젯 업데이트")
                 log.info("update toast shown: v%s", latest)
 
-    def _install_release(self, ver, assets):
+    def _install_release(self, ver, assets, digests=None):
         """릴리스의 새 EXE를 받아 제자리 교체 후 재시작.
 
         실행 중인 EXE는 덮어쓸 수 없지만 이름 바꾸기는 되므로,
@@ -3184,17 +3717,19 @@ class TrayApp:
         순서로 바꾼다. 두 번째 rename이 실패하면 첫 번째를 되돌려
         반쯤 바뀐 채 끝나지 않게 한다. .old 는 다음 시작이 지운다
         (finish_exe_update — 새 버전이 못 떴으면 수동 복구용으로 남는다).
+        받은 파일은 GitHub가 주는 SHA-256과 맞아야만 교체에 쓴다.
         """
         import subprocess
+        digests = digests or {}
         exe = sys.executable
         new, old = exe + ".new", exe + ".old"
-        download_file(assets[WIDGET_ASSET], new)
+        download_file(assets[WIDGET_ASSET], new, digests.get(WIDGET_ASSET))
         check_exe(new)
         hook = os.path.join(os.path.dirname(exe), HOOK_ASSET)
         hurl = assets.get(HOOK_ASSET)
         if hurl and os.path.exists(hook):
             try:
-                download_file(hurl, hook + ".new")
+                download_file(hurl, hook + ".new", digests.get(HOOK_ASSET))
                 check_exe(hook + ".new")
                 os.replace(hook + ".new", hook)  # 순간 실행이라 대개 안 잠겨 있다
             except (OSError, RuntimeError):
@@ -3225,47 +3760,31 @@ class TrayApp:
         self.q.put(("quit",))
 
     def _do_update(self):
-        """패치노트를 보여주고 확인하면 교체 후 재시작. (별도 스레드)
+        """업데이트 창의 [지금 설치] — 교체 후 재시작한다. (별도 스레드)
 
-        EXE 배포본은 릴리스의 새 EXE로, 소스 실행은 저장소 zip으로 바꾼다.
+        패치노트는 창이 이미 보여줬고, 누른 것이 곧 확인이다. EXE 배포본은
+        릴리스의 새 EXE로, 소스 실행은 저장소 zip으로 바꾼다(개발 폴더는
+        창이 git pull을 안내하고 여기까지 오지 않는다). 실패하면 사유를
+        update_error에 남겨 창이 보여주고, 다시 시도할 수 있게 둔다.
         """
         import shutil
         import subprocess
         import tempfile
         info = self.update_info
-        if not info or self._updating:
+        if not info or self._updating or self.update_method() == "git":
             return
-        ver, notes = info[0], info[1]
+        ver = info[0]
+        self._updating = True
+        self.update_error = None
         if getattr(sys, "frozen", False):
-            assets = info[2] or {}
-            ok = _msgbox(f"v{ver} 패치노트:\n\n{notes[:1500]}\n\n"
-                         "지금 설치하고 재시작할까요?",
-                         f"Claude 위젯 업데이트 v{ver}", 0x41)  # OKCANCEL|INFO
-            if ok != 1:                                         # IDOK
-                return
-            self._updating = True
             try:
-                self._install_release(ver, assets)
+                self._install_release(ver, info[2] or {}, info[3] or {})
             except Exception as e:
                 log.exception("update failed")
                 self._updating = False
-                _msgbox(f"업데이트 실패: {e}\n\n"
-                        "README의 설치 명령으로 다시 설치하면 해결됩니다.",
-                        "Claude 위젯 업데이트", 0x10)           # MB_ICONERROR
+                self.update_error = str(e)
             return
         here = os.path.dirname(os.path.abspath(__file__))
-        if os.path.isdir(os.path.join(here, ".git")):
-            _msgbox(f"v{ver} 패치노트:\n\n{notes[:1500]}\n\n"
-                    "개발 폴더(git 저장소)에서 실행 중이라 자동 설치는 하지 "
-                    "않습니다. git pull 로 업데이트하세요.",
-                    "Claude 위젯 업데이트", 0x40)      # MB_ICONINFORMATION
-            return
-        ok = _msgbox(f"v{ver} 패치노트:\n\n{notes[:1500]}\n\n"
-                     "지금 설치하고 재시작할까요?",
-                     f"Claude 위젯 업데이트 v{ver}", 0x41)  # OKCANCEL | INFO
-        if ok != 1:                                         # IDOK
-            return
-        self._updating = True
         try:
             src = download_repo(tempfile.mkdtemp(prefix="ctw-update-"))
             shutil.copytree(src, here, dirs_exist_ok=True)
@@ -3280,9 +3799,7 @@ class TrayApp:
         except Exception as e:
             log.exception("update failed")
             self._updating = False
-            _msgbox(f"업데이트 실패: {e}\n\n"
-                    "README의 설치 명령으로 다시 설치하면 해결됩니다.",
-                    "Claude 위젯 업데이트", 0x10)           # MB_ICONERROR
+            self.update_error = str(e)
 
     def _update_hooks(self, src):
         """설치돼 있는 ~/.claude 훅 사본도 새 버전으로 갱신 (없으면 건너뜀)."""
@@ -3311,6 +3828,11 @@ class TrayApp:
         next_upd = time.time() + 30     # 시작 직후 부하를 피해 30초 뒤 첫 확인
         throttle_until = 0.0
         throttle_streak = 0
+        # 서버가 허용하는 간격을 배워 둔 값. 429로 끊기면 두 배, 연달아
+        # 성공하면 조금씩 줄인다 — 60초 고정이던 때는 "성공 1번 → 429 6~7번"이
+        # 되풀이돼 호출의 대부분이 헛걸음이었다(2026-09-23 로그: 한 시간
+        # 성공 2 / 429 13).
+        api_gap = API_INTERVAL_ACTIVE
         last_ts = None
         last_attempt = 0.0
         api_denied_reason = None
@@ -3349,7 +3871,7 @@ class TrayApp:
                     # 인증이 죽은 상태의 이벤트 재시도는 헛 호출만 쌓는다 —
                     # 재로그인은 credentials 변경 감지가 즉시 잡는다
                     if now >= throttle_until and not api_denied_reason and \
-                            now - last_attempt >= EVENT_MIN_GAP:
+                            now - last_attempt >= max(EVENT_MIN_GAP, api_gap):
                         next_api = min(next_api, now)
 
                 if now >= next_api:
@@ -3371,11 +3893,15 @@ class TrayApp:
                                 log.info("api ok: %d rows", len(rows))
                             if not self.cfg.get("setup_token"):
                                 self._adopt_setup_token()
-                        next_api = now + (API_INTERVAL_ACTIVE if active
-                                          else API_INTERVAL_IDLE)
+                        next_api = now + (api_gap if active else
+                                          max(API_INTERVAL_IDLE, api_gap))
+                        api_gap = max(API_INTERVAL_ACTIVE, int(api_gap * 0.85))
                     except ApiThrottled as e:
                         api_ok = False
                         throttle_streak += 1
+                        if throttle_streak == 1:    # 한 번 끊길 때마다 한 번만
+                            api_gap = min(api_gap * 2, API_INTERVAL_IDLE)
+                            log.info("api pacing -> %ds", api_gap)
                         if e.retry_after:
                             # 서버가 명시한 대기는 이벤트 재시도도 존중 —
                             # 그 전에 찌르면 잠금 창만 계속 연장된다
@@ -3423,8 +3949,11 @@ class TrayApp:
                     if got:
                         self.q.put(("data", got[0], "hook", got[1]))
                     if not first and now >= throttle_until \
-                            and not api_denied_reason:
+                            and not api_denied_reason \
+                            and (api_gap <= API_INTERVAL_ACTIVE
+                                 or now - last_attempt >= api_gap):
                         # 답변 직후 = 사용량이 막 변한 시점, 즉시 재조회
+                        # (서버가 간격을 요구하는 동안은 그 간격을 지킨다)
                         next_api = min(next_api, now)
 
                 if not self.rows:
@@ -3452,6 +3981,17 @@ class TrayApp:
                 self.skill_tracker.refresh(force=first)
             except Exception:
                 log.exception("skill tracker refresh failed")
+            report = self.skill_tracker.repair_report
+            if report is not None and self.icon:
+                self.skill_tracker.repair_report = None
+                try:
+                    self.icon.notify(
+                        "스킬 기록 파일이 손상돼 자동으로 복구했습니다 — "
+                        f"기록 {report.get('events', 0)}건 보존, 원본은 "
+                        "로그 폴더에 .corrupt 사본으로 남겨 뒀어요",
+                        "Claude 위젯")
+                except Exception:
+                    pass
             if first or ticks % 30 == 0:    # Codex 사용량은 60초마다
                 try:
                     # 바에 패널이 뜨는 조건과 같게, 실행 중일 때만 조회한다
@@ -3502,7 +4042,7 @@ class TrayApp:
         upd = []
         if self.update_info:
             upd = [pystray.MenuItem(f"새 버전 v{self.update_info[0]} 설치…",
-                                    lambda i, it: self.q.put(("update",)))]
+                                    lambda i, it: self.q.put(("whatsnew",)))]
         # 자동 설치 토글은 EXE 배포본에서만 — 소스 실행은 자동 교체가 없다
         autoupd = []
         if getattr(sys, "frozen", False):
@@ -3548,7 +4088,8 @@ class TrayApp:
                              checked=lambda it: startup_installed()),
             *autoupd,
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("패치 이력 보기", lambda i, it: self.q.put(("notes",))),
+            pystray.MenuItem("업데이트 소식 보기",
+                             lambda i, it: self.q.put(("whatsnew",))),
             pystray.MenuItem("로그 폴더 열기", lambda i, it: self.q.put(("log",))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("종료", lambda i, it: self.q.put(("quit",))),
@@ -3610,6 +4151,30 @@ class TrayApp:
         except Exception as e:
             log.error("tray refresh failed: %s", e)
 
+    def _startup_notice(self):
+        """첫 설치면 어디를 보면 되는지, 업데이트 직후면 무엇이 바뀌었는지 —
+        토스트 한 번. 창을 띄우지 않으니 전체화면 앱에서 포커스를 뺏지 않는다."""
+        if not self.icon:
+            return
+        try:
+            if self._fresh_install:
+                self.icon.notify(
+                    "설치 완료 — 작업표시줄 오른쪽에 Claude 사용량이 표시됩니다. "
+                    "트레이의 Claude 아이콘을 누르면 메뉴가 열려요.",
+                    "AI Taskbar Widget")
+                return
+            wn = self.cfg.get("whats_new")
+            if wn and wn.get("to") == __version__ and not wn.get("toasted"):
+                head = self.headline_for(__version__)
+                self.icon.notify(
+                    f"v{__version__} 업데이트 완료" + (f" — {head}" if head else "")
+                    + f"\n{self.where_to_look()} 바뀐 점을 볼 수 있어요",
+                    "Claude 위젯 업데이트")
+                wn["toasted"] = True
+                save_config(self.cfg)
+        except Exception as e:
+            log.info("startup notice skipped: %s", e)
+
     def _pump(self, icon):
         icon.visible = True
         self._refresh_tray()
@@ -3617,6 +4182,9 @@ class TrayApp:
             t = threading.Timer(delay, lambda: demote_tray_icon())
             t.daemon = True
             t.start()
+        t = threading.Timer(4, self._startup_notice)    # 아이콘이 자리 잡은 뒤
+        t.daemon = True
+        t.start()
         threading.Thread(target=self._poll_loop, daemon=True).start()
         threading.Thread(target=self._skill_loop, daemon=True).start()
         threading.Thread(target=self._singleton_listener, daemon=True).start()
@@ -3697,11 +4265,10 @@ class TrayApp:
                 self.cfg["auto_update"] = not self.cfg.get("auto_update", True)
                 save_config(self.cfg)
                 self._refresh_tray()
-            elif kind == "update":
+            elif kind == "update_now":
                 threading.Thread(target=self._do_update, daemon=True).start()
-            elif kind == "notes":
-                import webbrowser
-                webbrowser.open(CHANGELOG_PAGE)
+            elif kind == "whatsnew":
+                self.whats_new_requested.set()
             elif kind == "log":
                 os.startfile(APPDATA_DIR)
             elif kind == "quit":

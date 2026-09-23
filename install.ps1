@@ -1,14 +1,83 @@
 ﻿# AI Skill Widget installer for Windows 10/11.
 # Installs the self-contained app, startup entry, and token-free Claude hooks.
+# 가장 쉬운 길: 저장소 폴더의 install.cmd 더블클릭 (Python·빌드 불필요).
+#   dist\ 에 직접 빌드한 EXE가 있으면 그걸, 없으면 GitHub 최신 릴리스 EXE를
+#   받아 SHA-256을 확인한 뒤 설치한다. -FromRelease 는 dist\ 가 있어도 릴리스를 쓴다.
+param(
+    [switch]$FromRelease
+)
 $ErrorActionPreference = "Stop"
+# PowerShell 5.1은 진행 막대를 그리느라 내려받기가 몇 배 느려진다
+$ProgressPreference = "SilentlyContinue"
+
+trap {
+    Write-Host ""
+    Write-Host "설치를 끝내지 못했습니다: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "같은 방법으로 다시 실행하면 이어서 설치됩니다 — 설정과 기록은 그대로 남습니다."
+    exit 1
+}
 
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $repo "dist"
 $widgetSource = Join-Path $dist "AI-Skill-Widget.exe"
 $hookSource = Join-Path $dist "SkillEventHook.exe"
+$gitHubRepo = "KimJinWooDa/ai-taskbar-widget"
 
-if (-not (Test-Path $widgetSource) -or -not (Test-Path $hookSource)) {
-    throw "dist 실행 파일이 없습니다. 먼저 .\build.ps1 을 실행하세요."
+# 받은 EXE 검증 — 잘린 다운로드(크기·MZ)와 바뀐 파일(GitHub가 자산마다
+# 주는 SHA-256 digest)을 모두 거른다. 위젯의 자동 업데이트와 같은 기준이다.
+function Test-ReleaseExe {
+    param([string]$Path, [string]$Digest)
+    if ((Get-Item $Path).Length -lt 5000000) {
+        throw "내려받은 파일이 너무 작습니다(잘린 다운로드): $Path"
+    }
+    $fs = [IO.File]::OpenRead($Path)
+    try {
+        $head = New-Object byte[] 2
+        [void]$fs.Read($head, 0, 2)
+    }
+    finally { $fs.Dispose() }
+    if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+        throw "내려받은 파일이 실행 파일이 아닙니다: $Path"
+    }
+    if ($Digest) {
+        $hash = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+        if ("sha256:$hash" -ne $Digest.ToLowerInvariant()) {
+            throw "SHA-256이 릴리스 정보와 다릅니다 — 손상됐거나 바뀐 파일이라 설치하지 않습니다"
+        }
+    }
+}
+
+if (-not $FromRelease -and (Test-Path $widgetSource) -and (Test-Path $hookSource)) {
+    Write-Host "[0/5] 직접 빌드한 실행 파일 사용 -> $dist"
+}
+else {
+    Write-Host "[0/5] 최신 릴리스 내려받기 (github.com/$gitHubRepo)"
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $headers = @{ "User-Agent" = "ai-taskbar-widget-installer" }
+    try {
+        $release = Invoke-RestMethod -UseBasicParsing -Headers $headers `
+            -Uri "https://api.github.com/repos/$gitHubRepo/releases/latest"
+    }
+    catch {
+        throw "릴리스 정보를 못 읽었습니다($($_.Exception.Message)). 인터넷 연결을 확인하거나, Python 3.10+이 있으면 build.ps1 로 직접 빌드한 뒤 다시 실행하세요."
+    }
+    $downloadDir = Join-Path $env:TEMP "ai-taskbar-widget-install"
+    New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+    $prefix = "https://github.com/$gitHubRepo/releases/download/"
+    foreach ($name in @("AI-Skill-Widget.exe", "SkillEventHook.exe")) {
+        $asset = @($release.assets | Where-Object { $_.name -eq $name })[0]
+        if (-not $asset) { throw "릴리스 $($release.tag_name)에 $name 이 없습니다." }
+        $url = [string]$asset.browser_download_url
+        if (-not $url.StartsWith($prefix)) { throw "예상 밖의 다운로드 주소라 거부합니다: $url" }
+        $out = Join-Path $downloadDir $name
+        Write-Host "  $name ($([math]::Round($asset.size / 1MB, 1)) MB)"
+        Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri $url -OutFile $out
+        Test-ReleaseExe -Path $out -Digest ([string]$asset.digest)
+    }
+    $widgetSource = Join-Path $downloadDir "AI-Skill-Widget.exe"
+    $hookSource = Join-Path $downloadDir "SkillEventHook.exe"
+    Write-Host "  $($release.tag_name) 확인 완료 (SHA-256 일치)"
 }
 
 $installDir = Join-Path $env:LOCALAPPDATA "AI-Skill-Widget"
@@ -177,4 +246,10 @@ Start-ScheduledTask -TaskName "AI Taskbar Widget"
 
 Write-Host ""
 Write-Host "설치 완료. 이후 별도 명령 없이 자동 추적됩니다." -ForegroundColor Green
+Write-Host "- 작업표시줄 오른쪽(트레이 옆)에 사용량 바가 나타납니다. 트레이의 Claude 아이콘을 누르면 메뉴가 열립니다."
+Write-Host "- 새 버전은 위젯이 알아서 받아 설치하고, 무엇이 바뀌었는지 바의 '업데이트' 패널로 알려 줍니다."
 Write-Host "Claude 자동 호출/수동 호출은 정확히 집계하고, Codex 자동 호출은 ~추정으로 표시합니다."
+if (-not (Test-Path (Join-Path $claudeDir ".credentials.json"))) {
+    Write-Host ""
+    Write-Host "참고: Claude Code 로그인 정보가 아직 없습니다 — 터미널에서 claude 를 실행해 로그인하면 사용량이 바로 표시됩니다." -ForegroundColor Yellow
+}

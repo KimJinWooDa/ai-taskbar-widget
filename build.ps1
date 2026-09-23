@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Python = "python"
 )
 
@@ -26,6 +26,8 @@ try {
         --specpath (Join-Path $repo "build") `
         --hidden-import "pystray._win32" `
         --hidden-import "PIL._tkinter_finder" `
+        --exclude-module numpy `
+        --add-data "$(Join-Path $repo 'CHANGELOG.md');." `
         (Join-Path $repo "ClaudeUsageWidget.pyw")
     if ($LASTEXITCODE -ne 0) { throw "위젯 EXE 빌드 실패 ($LASTEXITCODE)" }
 

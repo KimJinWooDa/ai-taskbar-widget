@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $installDir = Join-Path $env:LOCALAPPDATA "AI-Skill-Widget"
 $startupVbs = Join-Path $env:APPDATA `

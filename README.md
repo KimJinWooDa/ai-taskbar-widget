@@ -6,10 +6,10 @@
 
 [![Platform](https://img.shields.io/badge/Windows%2010%2F11-0078d4?style=flat-square)](#설치)
 [![Runtime](https://img.shields.io/badge/Standalone_EXE-no_Python-2ea043?style=flat-square)](#설치)
-[![Version](https://img.shields.io/badge/version-v3.17.0-d97757?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v3.18.0-d97757?style=flat-square)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-6e7681?style=flat-square)](LICENSE)
 
-**[설치](#설치)** · **[화면 구성](#화면-구성)** · **[루틴 알림](#루틴-알림)** · **[스킬 집계](#스킬-집계)** · **[개인정보](#네트워크와-개인정보)** · **[패치 이력](CHANGELOG.md)**
+**[설치](#설치)** · **[업데이트 알림](#업데이트-알림)** · **[화면 구성](#화면-구성)** · **[루틴 알림](#루틴-알림)** · **[스킬 집계](#스킬-집계)** · **[개인정보](#네트워크와-개인정보)** · **[패치 이력](CHANGELOG.md)**
 
 </div>
 
@@ -32,34 +32,53 @@
 
 ```powershell
 git clone https://github.com/KimJinWooDa/ai-taskbar-widget.git
-cd ai-taskbar-widget
-Set-ExecutionPolicy -Scope Process Bypass
-.\build.ps1      # dist\ 에 EXE가 이미 있다면 생략
-.\install.ps1
 ```
 
+그다음 **`ai-taskbar-widget` 폴더의 `install.cmd`를 더블클릭**하면 끝입니다.
+Python도, 빌드도, 실행 정책 설정도 필요 없습니다 — 최신 릴리스 EXE를 받아
+SHA-256을 확인한 뒤 설치합니다. (git이 없으면 GitHub의 `Code → Download ZIP`을
+풀어서 똑같이 `install.cmd`를 더블클릭하면 됩니다.)
+
 > [!NOTE]
-> 빌드에만 Python 3.10+가 필요합니다. 실행은 **단독 EXE** — Python 불필요.
+> 설치가 끝나면 작업표시줄 오른쪽에 사용량 바가 나타납니다. 이후 새 버전은
+> 위젯이 알아서 받아 설치하고, **무엇이 바뀌었는지 바의 '업데이트' 패널로
+> 알려 줍니다** → [업데이트 알림](#업데이트-알림)
 
 <details>
-<summary><b>설치가 하는 일 · 제거</b></summary>
+<summary><b>설치가 하는 일 · 제거 · 직접 빌드</b></summary>
 
 <br>
 
-- EXE를 `%LOCALAPPDATA%\AI-Skill-Widget`에 복사하고 Windows 자동 시작에 등록
+- `dist\`에 직접 빌드한 EXE가 있으면 그걸, 없으면 GitHub 최신 릴리스 EXE를
+  받습니다 (GitHub가 파일마다 주는 SHA-256과 다르면 설치하지 않음)
+- EXE를 `%LOCALAPPDATA%\AI-Skill-Widget`에 복사하고 로그온 예약 작업으로
+  자동 시작에 등록
 - Claude 훅을 기존 설정에 **병합** — 기존 `~/.claude/settings.json`은
   `settings.json.skill-widget.bak`으로 백업
-- 새 버전은 위젯이 하루 한 번 GitHub 릴리스를 확인해 **자동으로 설치**합니다
-  (트레이 메뉴 `새 버전 자동 설치` 토글로 끄면 알림·수동 설치만)
+- 이미 설치돼 있어도 다시 실행하면 그대로 덮어써 고쳐집니다 — 설정과 기록은 유지
 
-제거(스킬 호출 기록 DB는 보존):
+제거는 **`uninstall.cmd` 더블클릭**(스킬 호출 기록 DB는 보존).
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\uninstall.ps1
-```
+직접 빌드하려면 Python 3.10+에서 `.\build.ps1` → `install.cmd` 순서로 실행합니다.
+PowerShell에서 바로 돌리려면 `powershell -ExecutionPolicy Bypass -File .\install.ps1`
+(`-FromRelease`를 붙이면 `dist\`가 있어도 릴리스를 받습니다).
 
 </details>
+
+## 업데이트 알림
+
+- 위젯이 **6시간마다** 새 릴리스를 확인해 받아 설치하고 스스로 재시작합니다.
+  받은 파일은 SHA-256이 맞아야만 교체에 씁니다.
+- 재시작 직후 바 왼쪽에 파란 **'업데이트' 패널**이 뜹니다. 누르면 이전
+  버전부터 지금까지의 패치노트가 열리고(오프라인에서도 — 패치노트가 EXE에
+  들어 있음), 우클릭하면 그냥 닫힙니다. 안 눌러도 3일 뒤 내려갑니다.
+  `바 위치 잠금`으로 클릭이 통과하는 바라면 패널과 알림이 트레이 메뉴
+  `업데이트 소식 보기`를 가리킵니다.
+- 트레이 메뉴 `새 버전 자동 설치`를 끄면 설치 전에 패널이 먼저 뜹니다 —
+  건너뛴 버전들의 패치노트를 모두 보고 **`지금 설치`** 한 번으로 끝납니다.
+- 설치가 실패하면 이유와 **`다시 시도`** 버튼이 나오고, 그래도 안 되면
+  `install.cmd`를 다시 실행하면 됩니다(설정·기록 유지).
+- 지난 변경 내용은 언제든 트레이 메뉴 `업데이트 소식 보기`로 볼 수 있습니다.
 
 ## 화면 구성
 
@@ -187,8 +206,9 @@ powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\scheduled-tas
 | Claude 사용량 조회 | `api.anthropic.com` | 로그인 토큰으로 잔량만 읽기 |
 | Claude 토큰 갱신 | `platform.claude.com` | 만료된 로그인 토큰 갱신 |
 | Codex 사용량 조회 | `chatgpt.com` | auth.json 토큰으로 잔량만 읽기 |
-| 업데이트 확인 (하루 1회) | `api.github.com` | 최신 릴리스 버전만 읽기 |
-| 업데이트 설치 (자동, 끌 수 있음) | `github.com` | 릴리스의 새 EXE 다운로드 |
+| 업데이트 확인 (6시간마다) | `api.github.com` | 최신 릴리스 버전·패치노트만 읽기 |
+| 업데이트 설치 (자동, 끌 수 있음) · `install.cmd` | `github.com` | 릴리스의 새 EXE 다운로드 |
+| 업데이트 확인 (소스 실행일 때만) | `raw.githubusercontent.com` | CHANGELOG.md 읽기 |
 | 스킬 설명 번역 | `translate.googleapis.com` | 스킬 설명 텍스트(공개 문서)만 |
 
 <details>
@@ -201,7 +221,12 @@ powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\scheduled-tas
   추적 때문에 추가되는 모델 입력 토큰은 **0**입니다.
 - Codex는 훅 없이 기존 로컬 세션 JSONL을 증분 읽기합니다.
 - 로컬 SQLite(`%APPDATA%\ClaudeUsageWidget\skill-usage.db`)에는 스킬명, 앱,
-  시각, 자동/수동/추정 구분만 기록합니다.
+  시각, 자동/수동/추정 구분만 기록합니다. 훅은 DB를 열지 않고 같은 폴더의
+  `skill-events.jsonl`에 이벤트 한 줄(해시 ID·스킬명·시각)만 남기며, 위젯이
+  그걸 DB로 옮깁니다. DB가 손상되면 원본을 `.corrupt-날짜` 사본으로 남기고
+  읽을 수 있는 기록을 새 파일로 옮겨 스스로 복구합니다.
+- `장수 토큰 등록`으로 넣은 토큰은 `config.json`에 평문이 아니라 Windows
+  계정에 묶인 DPAPI로 암호화해 저장합니다.
 - 루틴 알림 로그는 읽기만 — 쓰거나 지우지 않고, 어디로도 보내지 않습니다.
 - 사용량 조회에 쓰는 토큰은 저장하거나 다른 곳으로 전송하지 않습니다.
 
@@ -214,8 +239,12 @@ Python 3.10+ 환경에서:
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1                                  # dist\AI-Skill-Widget.exe + SkillEventHook.exe
-python -m unittest discover -s tests -v      # 테스트
+python -m unittest discover -s tests -v      # 테스트 (릴리스 워크플로도 같은 테스트를 통과해야 배포)
 ```
+
+배포는 `__version__`·CHANGELOG 갱신 → 커밋 → `v*` 태그 푸시로 끝납니다 —
+GitHub Actions가 테스트·빌드 후 릴리스에 EXE를 붙이고, 사용자 위젯이 6시간
+안에 받아 갑니다.
 
 ## 크레딧
 

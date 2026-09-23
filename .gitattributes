@@ -1,0 +1,2 @@
+# Batch files need CRLF whatever the local git settings are
+*.cmd text eol=crlf
