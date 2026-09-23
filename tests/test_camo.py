@@ -78,6 +78,30 @@ class SampleComposeTests(unittest.TestCase):
         self.assertIsNone(bar._compose(None, busy, 100, 4))
 
 
+class WindowExeCacheTests(unittest.TestCase):
+    """전체화면 중 30ms마다 묻는 창 주인 이름 — PID별로 기억한다."""
+
+    def test_second_lookup_skips_open_process(self):
+        u = widget.ctypes.windll.user32
+        u.GetDesktopWindow.restype = widget.ctypes.c_void_p
+        hwnd = u.GetDesktopWindow()         # 늘 있는 창 — 주인은 csrss/explorer
+        widget._exe_cache.clear()
+        first = widget._window_exe(hwnd)
+        k = widget.ctypes.windll.kernel32
+        with mock.patch.object(k, "OpenProcess",
+                               side_effect=AssertionError("reopened")):
+            self.assertEqual(widget._window_exe(hwnd), first)
+
+    def test_cache_is_emptied_every_minute(self):
+        widget._exe_cache.clear()
+        widget._exe_cache[123456] = "stale.exe"
+        with mock.patch.object(widget, "_exe_cache_at", 0.0):
+            u = widget.ctypes.windll.user32
+            u.GetDesktopWindow.restype = widget.ctypes.c_void_p
+            widget._window_exe(u.GetDesktopWindow())
+        self.assertNotIn(123456, widget._exe_cache)
+
+
 class SyncLoopTests(unittest.TestCase):
     """0.5초 간격 표본을 차례로 먹여 언제 새 배경을 만드는지 본다."""
 

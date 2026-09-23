@@ -31,7 +31,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.18.4"
+__version__ = "3.18.5"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1311,28 +1311,46 @@ SNIP_EXES = {
 }
 _last_cover_exe = None
 _last_snip_at = 0.0     # 캡처 오버레이를 마지막으로 본 시각 — 종료 직후 오탐 방지
+# PID → 실행파일 이름. 전체화면 게임 중에는 복귀 감시(_watch_restore)가 30ms
+# 마다 캡처 오버레이인지 묻느라 이 조회를 네 번씩 했고, 매번 OpenProcess로
+# 이름을 읽던 것이 숨은 위젯 CPU(코어의 약 5%)의 대부분이었다(2026-09-23
+# py-spy 실측). 판단은 그대로 두고 이름만 기억한다. PID는 재사용될 수 있어
+# 1분마다 비운다.
+_exe_cache = {}
+_exe_cache_at = 0.0
 
 
 def _window_exe(hwnd):
     """창을 소유한 프로세스의 실행파일 이름(소문자) — 실패 시 ''."""
+    global _exe_cache_at
     try:
         u, k = ctypes.windll.user32, ctypes.windll.kernel32
         pid = ctypes.wintypes.DWORD()
         u.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
         if not pid.value:
             return ""
+        now = time.time()
+        if now - _exe_cache_at > 60:
+            _exe_cache.clear()
+            _exe_cache_at = now
+        name = _exe_cache.get(pid.value)
+        if name is not None:
+            return name
+        name = ""
         k.OpenProcess.restype = ctypes.c_void_p
         h = k.OpenProcess(0x1000, False, pid.value)   # QUERY_LIMITED_INFORMATION
-        if not h:
-            return ""
-        try:
-            buf = ctypes.create_unicode_buffer(512)
-            n = ctypes.wintypes.DWORD(512)
-            if k.QueryFullProcessImageNameW(ctypes.c_void_p(h), 0, buf,
-                                            ctypes.byref(n)):
-                return os.path.basename(buf.value).lower()
-        finally:
-            k.CloseHandle(ctypes.c_void_p(h))
+        if h:
+            try:
+                buf = ctypes.create_unicode_buffer(512)
+                n = ctypes.wintypes.DWORD(512)
+                if k.QueryFullProcessImageNameW(ctypes.c_void_p(h), 0, buf,
+                                                ctypes.byref(n)):
+                    name = os.path.basename(buf.value).lower()
+            finally:
+                k.CloseHandle(ctypes.c_void_p(h))
+        # 못 읽은 것('')도 기억한다 — 보호된 프로세스를 30ms마다 다시 두드리지 않게
+        _exe_cache[pid.value] = name
+        return name
     except Exception:
         pass
     return ""
