@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import time
 import types
@@ -7,6 +8,9 @@ import unittest
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
+# 위젯 모듈은 불러오는 순간 %APPDATA%\ClaudeUsageWidget에 로그를 연다 —
+# 테스트가 사용자의 실제 widget.log·설정에 흔적을 남기지 않게 임시 폴더로 돌린다
+os.environ["APPDATA"] = tempfile.mkdtemp(prefix="widget-test-")
 _spec = importlib.util.spec_from_file_location(
     "widget_main", _ROOT / "ClaudeUsageWidget.pyw")
 widget = importlib.util.module_from_spec(_spec)

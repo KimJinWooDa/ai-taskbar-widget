@@ -10,6 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 _ROOT = Path(__file__).resolve().parent.parent
+# 위젯 모듈은 불러오는 순간 %APPDATA%\ClaudeUsageWidget에 로그를 연다 —
+# 테스트가 사용자의 실제 widget.log·설정에 흔적을 남기지 않게 임시 폴더로 돌린다
+os.environ["APPDATA"] = tempfile.mkdtemp(prefix="widget-test-")
 _spec = importlib.util.spec_from_file_location(
     "widget_main", _ROOT / "ClaudeUsageWidget.pyw")
 widget = importlib.util.module_from_spec(_spec)
@@ -218,6 +221,19 @@ class WhatsNewTests(unittest.TestCase):
         _, _, entries = app.whats_new_view()
         self.assertEqual([e["v"] for e in entries], ["3.18.0"])
 
+    def test_pre_tracking_upgrade_lists_everything_since_tracking_began(self):
+        # 3.17.2 이하에는 last_run_version이 없다 — 3.18.1로 바로 올라와도
+        # 3.18.0 패치노트까지 보여야 한다
+        text = "## v3.18.1 — b\n- **재시도**\n\n" + CHANGELOG.split("\n", 3)[3]
+        with mock.patch.object(widget, "local_changelog", return_value=text), \
+                mock.patch.object(widget, "__version__", "3.18.1"):
+            app = self._app({"bar_right": 10})
+            app._note_version()
+            mode, sub, entries = app.whats_new_view()
+        self.assertEqual(mode, "installed")
+        self.assertEqual([e["v"] for e in entries], ["3.18.1", "3.18.0"])
+        self.assertEqual(sub, "v3.18.1 업데이트 완료")
+
     def test_fresh_install_has_no_whats_new(self):
         app = self._app({})
         self.assertTrue(app._note_version())
@@ -270,6 +286,38 @@ class DpapiConfigTests(unittest.TestCase):
             with open(widget.CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump({widget.TOKEN_ENC_KEY: "bm90LWRwYXBp", "x": 1}, f)
             self.assertEqual(widget.load_config(), {"x": 1})
+
+
+class RenameRetryTests(unittest.TestCase):
+    """PyInstaller EXE가 지연 import로 자기 파일을 잠깐 여는 순간을 넘긴다."""
+
+    def test_transient_sharing_violation_is_retried(self):
+        calls = []
+
+        def flaky(src, dst):
+            calls.append((src, dst))
+            if len(calls) < 3:
+                raise PermissionError(32, "in use")
+
+        with mock.patch.object(widget.os, "rename", side_effect=flaky), \
+                mock.patch.object(widget.time, "sleep"):
+            widget.rename_retry("a.exe", "a.exe.old")
+        self.assertEqual(len(calls), 3)
+
+    def test_persistent_lock_still_raises(self):
+        with mock.patch.object(widget.os, "rename",
+                               side_effect=PermissionError(32, "in use")), \
+                mock.patch.object(widget.time, "sleep") as slept:
+            with self.assertRaises(PermissionError):
+                widget.rename_retry("a.exe", "a.exe.old", tries=4)
+        self.assertEqual(slept.call_count, 3)
+
+    def test_other_errors_are_not_retried(self):
+        with mock.patch.object(widget.os, "rename",
+                               side_effect=FileNotFoundError()) as ren:
+            with self.assertRaises(FileNotFoundError):
+                widget.rename_retry("a.exe", "a.exe.old")
+        self.assertEqual(ren.call_count, 1)
 
 
 class CheckExeTests(unittest.TestCase):

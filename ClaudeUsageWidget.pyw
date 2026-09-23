@@ -31,7 +31,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.18.0"
+__version__ = "3.18.1"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -70,6 +70,9 @@ RELEASES_API_URL = f"https://api.github.com/repos/{REPO}/releases?per_page=20"
 # 릴리스 자산은 이 주소로 시작해야만 받는다 (API 응답이 엉뚱한 곳을 가리키면 거부)
 ASSET_URL_PREFIX = f"https://github.com/{REPO}/releases/download/"
 WHATS_NEW_DAYS = 3              # 업데이트 패널을 안 눌러도 이만큼 지나면 바에서 내린다
+# 실행 버전 기록(last_run_version)이 없던 마지막 버전 — 기록 없이 올라온
+# 사용자는 적어도 이 버전 이후의 패치노트를 전부 본다
+UNTRACKED_UNTIL = "3.17.2"
 WIDGET_ASSET = "AI-Skill-Widget.exe"
 HOOK_ASSET = "SkillEventHook.exe"
 EXE_MIN_BYTES = 5_000_000       # 잘린 다운로드로 교체하는 사고 방지
@@ -999,6 +1002,24 @@ def headline(items):
     text = m.group(1) if m else re.sub(r"[*`]", "", items[0])
     text = text.strip().rstrip(".")
     return text if len(text) <= 60 else text[:58] + "…"
+
+
+def rename_retry(src, dst, tries=20, wait=0.25):
+    """os.rename — 잠깐의 공유 위반(WinError 32)은 몇 초까지 다시 해 본다.
+
+    PyInstaller EXE는 모듈을 지연 import할 때마다 자기 EXE를 잠깐 연다
+    (삭제 공유 없이). 그 몇 ms에 교체용 이름 바꾸기가 겹치면 실패한다 —
+    2026-09-23 v3.17.2 → v3.18.0 자동 업데이트가 다른 스레드가 429 응답을
+    처리하던 순간 이렇게 실패했다. 잠금은 곧 풀리므로 기다렸다 다시 한다.
+    """
+    for attempt in range(tries):
+        try:
+            os.rename(src, dst)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(wait)
 
 
 def check_exe(path):
@@ -3527,9 +3548,8 @@ class TrayApp:
         wn = self.cfg.get("whats_new")
         if wn:
             hi = _ver_tuple(wn.get("to") or __version__)
-            lo = _ver_tuple(wn["from"]) if wn.get("from") else None
-            entries = [e for e in local if e["t"] <= hi
-                       and (e["t"] > lo if lo else e["t"] == hi)]
+            lo = _ver_tuple(wn.get("from") or UNTRACKED_UNTIL)
+            entries = [e for e in local if lo < e["t"] <= hi]
             sub = (f"v{wn['from']} → v{wn['to']} 업데이트 완료"
                    if wn.get("from") else f"v{wn['to']} 업데이트 완료")
             return "installed", sub, entries
@@ -3739,11 +3759,11 @@ class TrayApp:
                 os.remove(old)
         except OSError:
             pass
-        os.rename(exe, old)
+        rename_retry(exe, old)
         try:
-            os.rename(new, exe)
+            rename_retry(new, exe)
         except OSError:
-            os.rename(old, exe)         # 되돌린다
+            rename_retry(old, exe)      # 되돌린다
             raise
         log.info("update installed: v%s (exe swap)", ver)
         # 잠시 뒤 새 인스턴스를 띄운다. 새 인스턴스는 전임이 포트를 놓을
