@@ -31,7 +31,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.18.2"
+__version__ = "3.18.3"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1087,6 +1087,56 @@ def startup_installed():
     return os.path.exists(STARTUP_VBS)
 
 
+# 설치본의 자동 실행은 install.ps1이 만든 로그온 예약 작업(STARTUP_TASK)이
+# 맡는다. 메뉴 체크를 예전 방식의 시작프로그램 vbs로만 판정하던 탓에 켜져
+# 있는데도 꺼진 것처럼 보였고, 누르면 vbs가 하나 더 생겨 로그온마다 두 번
+# 떴다(2026-09-23 발견). 예약 작업이 있으면 그 로그온 트리거가 곧 스위치다 —
+# 작업 자체는 남겨 두므로 Claude 세션 시작 훅(schtasks /run)은 계속 된다.
+NO_WINDOW = 0x08000000          # CREATE_NO_WINDOW — 콘솔 창을 띄우지 않는다
+
+
+def logon_trigger_state(xml):
+    """schtasks /query /xml 결과 → 로그온 트리거가 켜져 있나. 트리거가 없으면 None."""
+    m = re.search(r"<LogonTrigger>(.*?)</LogonTrigger>", xml, re.S)
+    if not m:
+        return None
+    return not re.search(r"<Enabled>\s*false\s*</Enabled>", m.group(1))
+
+
+def task_autostart():
+    """예약 작업 기준 자동 실행 상태 — (작업이 있나, 로그온 시 켜지나)."""
+    import subprocess
+    try:
+        r = subprocess.run(["schtasks", "/query", "/tn", STARTUP_TASK, "/xml"],
+                           capture_output=True, timeout=15,
+                           creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return False, False
+    if r.returncode != 0:
+        return False, False             # 작업 없음 — 소스 실행·옛 설치
+    return True, bool(logon_trigger_state(r.stdout.decode("utf-8", "replace")))
+
+
+def set_task_autostart(on):
+    """예약 작업의 로그온 트리거를 켜거나 끈다. 트리거가 없으면 켤 때 만든다."""
+    import subprocess
+    flag = "$true" if on else "$false"
+    ps = ("$ErrorActionPreference = 'Stop'; "
+          f"$t = Get-ScheduledTask -TaskName '{STARTUP_TASK}'; "
+          "if ($t.Triggers.Count -eq 0) { "
+          f"if ({flag}) {{ Set-ScheduledTask -TaskName '{STARTUP_TASK}' "
+          "-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME) "
+          "| Out-Null } } else { "
+          f"foreach ($tr in $t.Triggers) {{ $tr.Enabled = {flag} }}; "
+          "Set-ScheduledTask -InputObject $t | Out-Null }")
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-Command", ps], capture_output=True, timeout=60,
+                       creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        raise OSError(r.stderr.decode("cp949", "replace").strip()[:200]
+                      or f"exit {r.returncode}")
+
+
 def install_startup():
     if getattr(sys, "frozen", False):
         content = ('CreateObject("Wscript.Shell").Run '
@@ -2051,7 +2101,10 @@ class FloatingBar(threading.Thread):
                 hint = f"설치 실패 · {press} 다시 시도"
             else:
                 hint = f"{press} 바뀐 점 보기·설치"
-            lines = [("새 버전", f"v{ver}", "", accent, accent, "")]
+            # 지금 버전을 옆에 둔다 — 새 버전 번호만 있으면 무엇에서 무엇으로
+            # 바뀌는지 알 수 없다
+            lines = [("새 버전", f"v{ver}", f" · 지금 v{__version__}",
+                      accent, accent, "")]
         else:
             ver = self.app.cfg["whats_new"].get("to") or __version__
             head = self.app.range_headline(*self.app.whats_new_range())
@@ -3466,7 +3519,11 @@ class TrayApp:
         # — 있으면 바의 업데이트 패널·메뉴에 뜬다
         self.update_info = None
         self.update_error = None    # 마지막 설치 실패 사유 — 업데이트 창이 보여준다
+        self.update_checked = False     # 새 버전 확인을 한 번이라도 마쳤나
         self._updating = False
+        # (예약 작업이 있나, 로그온 시 켜지나) — 메뉴가 열릴 때마다 schtasks를
+        # 부르지 않게 시작할 때와 토글 뒤에만 읽어 둔다
+        self.autostart = (False, startup_installed())
         self._headlines = {}        # 버전 → 한 줄 요약 (바가 0.5초마다 묻는다)
         self.icon = None
         self.cfg = load_config()
@@ -3541,6 +3598,49 @@ class TrayApp:
         wn = self.cfg.get("whats_new") or {}
         return (_ver_tuple(wn.get("from") or UNTRACKED_UNTIL),
                 _ver_tuple(wn.get("to") or __version__))
+
+    def version_line(self):
+        """트레이 메뉴의 버전 줄 — 바의 '업데이트 완료 vX'만으로는 그게 지금
+        버전인지 새 버전인지 헷갈린다는 지적이 있었다(2026-09-23)."""
+        if self.update_info:
+            return (f"현재 버전 v{__version__} · "
+                    f"새 버전 v{self.update_info[0]} 있음")
+        if self.update_checked:
+            return f"현재 버전 v{__version__} · 최신"
+        return f"현재 버전 v{__version__}"
+
+    def _refresh_autostart(self):
+        """자동 실행 상태를 다시 읽는다. 예약 작업이 있으면 그 로그온
+        트리거가 기준이고, 옛 토글이 남긴 시작프로그램 vbs는 중복 실행을
+        막으려고 치운다."""
+        has_task, on = task_autostart()
+        if has_task:
+            if startup_installed():
+                uninstall_startup()
+                log.info("legacy startup vbs removed (task handles autostart)")
+            self.autostart = (True, on)
+        else:
+            self.autostart = (False, startup_installed())
+        self.q.put(("menu",))
+
+    def _toggle_autostart(self):
+        """메뉴의 'Windows 시작 시 자동 실행' — 별도 스레드 (PowerShell이 느리다)."""
+        has_task, on = self.autostart
+        try:
+            if has_task:
+                set_task_autostart(not on)
+            elif on:
+                uninstall_startup()
+            else:
+                install_startup()
+            log.info("autostart -> %s (%s)", not on,
+                     "task" if has_task else "vbs")
+        except Exception as e:
+            log.warning("autostart toggle failed: %s", e)
+            if self.icon:
+                self.icon.notify(f"자동 실행 설정을 바꾸지 못했습니다 — {e}",
+                                 "Claude 위젯")
+        self._refresh_autostart()
 
     def where_to_look(self):
         """토스트가 가리킬 곳 — 잠긴 바는 클릭이 통과하므로 트레이 메뉴를 댄다."""
@@ -3686,6 +3786,7 @@ class TrayApp:
             if ver_t <= cur or not assets.get(WIDGET_ASSET):
                 self.update_info = None
                 self.update_error = None
+                self.update_checked = True
                 return
             log.info("update available: v%s (current v%s)",
                      latest, __version__)
@@ -3731,6 +3832,7 @@ class TrayApp:
                 return
             if entries[0]["t"] <= cur:
                 self.update_info = None
+                self.update_checked = True
                 return
             latest = entries[0]["v"]
             # 개발 실행은 원격 CHANGELOG에서 (지금, 최신] 절만 잘라 쓴다
@@ -3902,6 +4004,7 @@ class TrayApp:
                         self._check_update()
                     except Exception as e:
                         log.info("update check failed: %s", e)
+                    self.q.put(("menu",))   # 메뉴의 버전 줄(최신·새 버전)을 곧바로
 
                 # 전사 파일 갱신 = 방금 답변이 끝남 → 사용량이 변한 순간
                 ts_m = latest_transcript_mtime()
@@ -4127,9 +4230,10 @@ class TrayApp:
                                  self.cfg.get("usage_remaining"))),
             pystray.MenuItem("Windows 시작 시 자동 실행",
                              lambda i, it: self.q.put(("startup",)),
-                             checked=lambda it: startup_installed()),
+                             checked=lambda it: bool(self.autostart[1])),
             *autoupd,
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self.version_line(), None, enabled=False),
             pystray.MenuItem("업데이트 소식 보기",
                              lambda i, it: self.q.put(("whatsnew",))),
             pystray.MenuItem("로그 폴더 열기", lambda i, it: self.q.put(("log",))),
@@ -4230,6 +4334,7 @@ class TrayApp:
         threading.Thread(target=self._poll_loop, daemon=True).start()
         threading.Thread(target=self._skill_loop, daemon=True).start()
         threading.Thread(target=self._singleton_listener, daemon=True).start()
+        threading.Thread(target=self._refresh_autostart, daemon=True).start()
         FloatingBar(self).start()
 
         last_tray = 0.0
@@ -4301,7 +4406,9 @@ class TrayApp:
                 save_config(self.cfg)
                 self._refresh_tray()
             elif kind == "startup":
-                uninstall_startup() if startup_installed() else install_startup()
+                threading.Thread(target=self._toggle_autostart,
+                                 daemon=True).start()
+            elif kind == "menu":
                 self._refresh_tray()
             elif kind == "autoupd":
                 self.cfg["auto_update"] = not self.cfg.get("auto_update", True)

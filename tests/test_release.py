@@ -316,6 +316,102 @@ class DpapiConfigTests(unittest.TestCase):
             self.assertEqual(widget.load_config(), {"x": 1})
 
 
+TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task><Triggers><LogonTrigger>{enabled}<UserId>PC\\me</UserId></LogonTrigger>
+</Triggers><Settings><Enabled>true</Enabled></Settings></Task>"""
+
+
+class AutostartTests(unittest.TestCase):
+    """메뉴 체크 = 로그온 예약 작업의 트리거 (예전엔 없는 vbs만 봤다)."""
+
+    def test_logon_trigger_state_from_xml(self):
+        self.assertTrue(widget.logon_trigger_state(TASK_XML.format(enabled="")))
+        self.assertFalse(widget.logon_trigger_state(
+            TASK_XML.format(enabled="<Enabled>false</Enabled>")))
+        self.assertIsNone(widget.logon_trigger_state("<Task><Triggers/></Task>"))
+
+    def _run(self, rc, xml=""):
+        # 위젯은 subprocess를 함수 안에서 import한다 — 모듈 함수를 바꿔 끼운다
+        return mock.patch("subprocess.run", return_value=types.SimpleNamespace(
+            returncode=rc, stdout=xml.encode("utf-8"), stderr=b"denied"))
+
+    def test_task_autostart_reads_the_task(self):
+        with self._run(0, TASK_XML.format(enabled="")):
+            self.assertEqual(widget.task_autostart(), (True, True))
+        with self._run(0, TASK_XML.format(enabled="<Enabled>false</Enabled>")):
+            self.assertEqual(widget.task_autostart(), (True, False))
+        with self._run(1):
+            self.assertEqual(widget.task_autostart(), (False, False))
+
+    def test_set_task_autostart_toggles_triggers_without_a_window(self):
+        with self._run(0) as run:
+            widget.set_task_autostart(False)
+        args, kwargs = run.call_args
+        self.assertIn("$tr.Enabled = $false", args[0][-1])
+        self.assertEqual(kwargs["creationflags"], widget.NO_WINDOW)
+        with self._run(1):
+            with self.assertRaises(OSError):
+                widget.set_task_autostart(True)
+
+    def _app(self, autostart):
+        app = types.SimpleNamespace(autostart=autostart, q=mock.Mock(),
+                                    icon=None)
+        for name in ("_toggle_autostart", "_refresh_autostart"):
+            setattr(app, name,
+                    types.MethodType(getattr(widget.TrayApp, name), app))
+        return app
+
+    def test_toggle_uses_the_task_when_present(self):
+        app = self._app((True, True))
+        with mock.patch.object(widget, "set_task_autostart") as st, \
+                mock.patch.object(widget, "task_autostart",
+                                  return_value=(True, False)), \
+                mock.patch.object(widget, "startup_installed",
+                                  return_value=False), \
+                mock.patch.object(widget, "install_startup") as inst:
+            app._toggle_autostart()
+        st.assert_called_once_with(False)
+        inst.assert_not_called()                # no duplicate vbs any more
+        self.assertEqual(app.autostart, (True, False))
+
+    def test_toggle_falls_back_to_vbs_without_a_task(self):
+        app = self._app((False, False))
+        with mock.patch.object(widget, "task_autostart",
+                               return_value=(False, False)), \
+                mock.patch.object(widget, "startup_installed",
+                                  return_value=True), \
+                mock.patch.object(widget, "install_startup") as inst:
+            app._toggle_autostart()
+        inst.assert_called_once()
+        self.assertEqual(app.autostart, (False, True))
+
+    def test_legacy_vbs_removed_when_task_handles_autostart(self):
+        app = self._app((False, False))
+        with mock.patch.object(widget, "task_autostart",
+                               return_value=(True, True)), \
+                mock.patch.object(widget, "startup_installed",
+                                  return_value=True), \
+                mock.patch.object(widget, "uninstall_startup") as rm:
+            app._refresh_autostart()
+        rm.assert_called_once()
+        self.assertEqual(app.autostart, (True, True))
+        app.q.put.assert_called_with(("menu",))
+
+
+class VersionLineTests(unittest.TestCase):
+    def _line(self, update_info, checked):
+        app = types.SimpleNamespace(update_info=update_info,
+                                    update_checked=checked)
+        with mock.patch.object(widget, "__version__", "3.18.3"):
+            return widget.TrayApp.version_line(app)
+
+    def test_states(self):
+        self.assertEqual(self._line(None, False), "현재 버전 v3.18.3")
+        self.assertEqual(self._line(None, True), "현재 버전 v3.18.3 · 최신")
+        self.assertEqual(self._line(("3.19.0", "", {}, {}), True),
+                         "현재 버전 v3.18.3 · 새 버전 v3.19.0 있음")
+
+
 class RenameRetryTests(unittest.TestCase):
     """PyInstaller EXE가 지연 import로 자기 파일을 잠깐 여는 순간을 넘긴다."""
 

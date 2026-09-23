@@ -6,7 +6,7 @@
 
 [![Platform](https://img.shields.io/badge/Windows%2010%2F11-0078d4?style=flat-square)](#설치)
 [![Runtime](https://img.shields.io/badge/Standalone_EXE-no_Python-2ea043?style=flat-square)](#설치)
-[![Version](https://img.shields.io/badge/version-v3.18.2-d97757?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v3.18.3-d97757?style=flat-square)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-6e7681?style=flat-square)](LICENSE)
 
 **[설치](#설치)** · **[업데이트 알림](#업데이트-알림)** · **[화면 구성](#화면-구성)** · **[루틴 알림](#루틴-알림)** · **[스킬 집계](#스킬-집계)** · **[개인정보](#네트워크와-개인정보)** · **[패치 이력](CHANGELOG.md)**
@@ -79,6 +79,8 @@ PowerShell에서 바로 돌리려면 `powershell -ExecutionPolicy Bypass -File .
 - 설치가 실패하면 이유와 **`다시 시도`** 버튼이 나오고, 그래도 안 되면
   `install.cmd`를 다시 실행하면 됩니다(설정·기록 유지).
 - 지난 변경 내용은 언제든 트레이 메뉴 `업데이트 소식 보기`로 볼 수 있습니다.
+  바로 위 `현재 버전` 줄에 지금 버전과 최신 여부(새 버전이 있으면 그 번호)가
+  나옵니다.
 
 ## 화면 구성
 
