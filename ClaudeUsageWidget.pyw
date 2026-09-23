@@ -31,7 +31,7 @@ from skill_tracker import TrackerService
 from notifications import (NotificationService, LOG_PATH as NOTIFY_LOG,
                            ago as notify_ago, run_target as notify_run_target)
 
-__version__ = "3.18.3"
+__version__ = "3.18.4"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -1537,6 +1537,41 @@ class BITMAPINFOHEADER(ctypes.Structure):
                 ("biClrImportant", ctypes.wintypes.DWORD)]
 
 
+def blit_bgra(x, y, w, h):
+    """화면의 (x, y, w, h)만 GDI BitBlt로 떠서 BGRA 바이트로 — 실패하면 None.
+
+    PIL ImageGrab은 bbox를 줘도 화면 전체를 뜬 뒤 잘라낸다(2560×1440 실측
+    CPU 20ms). 이 경로는 그 영역만 옮겨 CPU 1ms 안팎이다. 다만 벽시계로는
+    DWM 합성 한 프레임(약 13ms)을 기다리므로, 자주 부를 곳은 Tk 스레드
+    밖에서 부른다. GDI만 쓰므로 어느 스레드에서 불러도 된다.
+    """
+    if w <= 0 or h <= 0:
+        return None
+    u, g = ctypes.windll.user32, ctypes.windll.gdi32
+    sdc = mdc = bmp = None
+    try:
+        sdc = u.GetDC(0)
+        mdc = g.CreateCompatibleDC(sdc)
+        bmp = g.CreateCompatibleBitmap(sdc, w, h)
+        g.SelectObject(mdc, bmp)
+        g.BitBlt(mdc, 0, 0, w, h, sdc, x, y, SRCCOPY)
+        hdr = BITMAPINFOHEADER()
+        hdr.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        hdr.biWidth, hdr.biHeight = w, -h           # 음수 = 위에서 아래로
+        hdr.biPlanes, hdr.biBitCount = 1, 32
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not g.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(hdr), 0):
+            return None
+        return buf.raw
+    finally:
+        if bmp:
+            g.DeleteObject(bmp)
+        if mdc:
+            g.DeleteDC(mdc)
+        if sdc:
+            u.ReleaseDC(0, sdc)
+
+
 class FloatingBar(threading.Thread):
     """작업표시줄에 얹히는 투명 세 줄 바 — 스킬 패널 + 사용량 패널.
 
@@ -1558,9 +1593,13 @@ class FloatingBar(threading.Thread):
     TICK_MS = 500           # 전체화면 전환을 늦게 알아채지 않도록 짧게 (2초→0.5초)
     RESTORE_MS = 30         # 숨어 있는 동안에만 도는 복귀 확인 (평소엔 안 돈다)
     HIDE_MS = 100           # 훅이 놓쳤을 때를 위한 보험 (평소엔 훅이 먼저 잡는다)
-    CAMO_EVERY = 20         # 10초마다 배경 확인
+    CAMO_EVERY = 20         # 10초마다 동결 검사(_health_check)
     ADOPT_EVERY = 120       # 60초마다 소유 관계 재확인
     CAMO_MAX_AGE = 300      # 옆 픽셀이 그대로여도 이 시간이 지나면 한 번 다시 찍는다
+    CAMO_SYNC_SEC = 0.5     # 작업표시줄 색 따라가기 주기 (_camo_loop)
+    CAMO_CONFIRM = 2        # 왼쪽 조각이 이만큼 연속으로 다르면 다시 입힌다 (≈1초)
+    CAMO_CONFIRM_RIGHT = 4  # 오른쪽은 트레이 아이콘 호버가 닿아 더 오래 본다 (≈2초)
+    CAMO_TOL = 3            # 채널당 이 이하 차이는 같은 색
     SIDE = 12               # 배경을 떠올 좌우 여백 폭
     CAMO_SETTLE_MS = 180    # 폭이 바뀐 뒤 배경을 찍기까지 기다리는 시간
     CAMO_MAX_SD = 12        # 이보다 거친 조각은 작업표시줄이 아니다(글자·아이콘)
@@ -1619,8 +1658,12 @@ class FloatingBar(threading.Thread):
         self._shown = False
         self._covered = 0
         self._ticks = 0
-        self._rgb = None
-        self._pending = None
+        # 배경 동기화 — 틱이 지금 바 자리(_camo_geom)를 알려 주고,
+        # _camo_loop 스레드가 떠 둔 새 배경(_camo_pending)을 틱이 입힌다
+        self._camo_geom = None          # (x, y, w, h) — 숨었거나 캡처 중이면 None
+        self._camo_pending = None
+        self._camo_ref = (None, None)   # 지금 입힌 배경을 뜬 순간의 양옆 평균색
+        self._camo_log_at = 0.0
         self._snip_active = False
         self._recapture = False
         self._mapped = False        # Tk deiconify는 처음 한 번만 (이후 Win32로)
@@ -1690,6 +1733,10 @@ class FloatingBar(threading.Thread):
         root.update_idletasks()  # 이걸 해야 최상위 창이 생긴다(그전엔 GetParent=0)
         self._apply_lock()       # 첫 deiconify 전에 걸어야 그때부터 안 뺏는다
         self._hook_events()      # 전체화면 전환은 훅이 즉시 받는다
+        # 창을 새로 만들 때마다 세대를 올린다 — 옛 창의 동기화 스레드는 스스로 끝난다
+        self._gen = getattr(self, "_gen", 0) + 1
+        threading.Thread(target=self._camo_loop, args=(self._gen,),
+                         daemon=True).start()
         self._tick()
         self._watch_hide()       # 훅이 놓친 경우의 보험
         root.mainloop()
@@ -1778,135 +1825,177 @@ class FloatingBar(threading.Thread):
                 return True
         return True     # 밴드에 창이 이례적으로 많으면 판단 보류 (오탐 방지)
 
-    def _probe(self):
-        """바 옆 작업표시줄 픽셀 몇 개의 평균 — 배경이 바뀌었는지 감지용.
+    def _sample_sides(self, geom):
+        """(x, y, w, h)에 놓인 바의 양옆 작업표시줄 조각 — BitBlt 한 번.
 
-        한 점만 보면 그 점이 우연히 안 변한 스타일 변화(테마·미카 톤 변경)를
-        놓친다. 위·아래·좌우로 흩어 뽑아 평균을 내면 훨씬 잘 잡힌다.
+        돌려주는 값은 (왼쪽, 오른쪽). 각 쪽은 (이미지, 평균색, 매끈한가),
+        화면 밖이면 None이다. 둘 다 없으면 None. Tk를 건드리지 않으므로
+        동기화 스레드에서도 부른다.
         """
-        try:
-            self.root.update_idletasks()    # geometry 반영 전 winfo_x()=0 방지
-            u, g = ctypes.windll.user32, ctypes.windll.gdi32
-            x, y, h = self.root.winfo_x(), self.root.winfo_y(), self._fix_h
-            # 전부 바 왼쪽의 빈 구간에서 — 오른쪽은 트레이 아이콘이 가까워서
-            # 아이콘이 바뀔 때마다 배경을 다시 만들게 된다(60초마다 재촬영의 원인)
-            pts = [(x - 6, y + h // 2), (x - 18, y + 3), (x - 6, y + h - 3),
-                   (x - 30, y + h // 2)]
-            dc = u.GetDC(0)
-            got = []
-            for px, py in pts:
-                c = g.GetPixel(dc, px, py)
-                if c >= 0:
-                    got.append((c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF))
-            u.ReleaseDC(0, dc)
-            if not got:
-                return None
-            return tuple(sum(c[i] for c in got) // len(got) for i in range(3))
-        except Exception:
+        from PIL import Image, ImageStat
+        x, y, w, h = geom
+        s = self.SIDE
+        u = ctypes.windll.user32
+        vx, vw = u.GetSystemMetrics(76), u.GetSystemMetrics(78)  # 가상 화면
+        x0, x1 = max(x - s, vx), min(x + w + s, vx + vw)
+        lw, rw = x - x0, x1 - (x + w)
+        if lw <= 0 and rw <= 0:
             return None
+        raw = blit_bgra(x0, y, x1 - x0, h)
+        if raw is None:
+            return None
+        span = Image.frombytes("RGB", (x1 - x0, h), raw, "raw", "BGRX")
 
-    def _match_background(self, force=False):
-        """바 양옆 작업표시줄을 떠서 그 사이를 이어 붙여 배경으로 쓴다.
+        def side(box):
+            part = span.crop(box)
+            st = ImageStat.Stat(part)
+            mean = tuple(int(round(v)) for v in st.mean[:3])
+            # 거친 조각은 작업표시줄 빈 구간이 아니다(글자·아이콘·툴팁) —
+            # 바가 방금 비운 자리엔 우리 글자가 아직 남아 있기도 하다.
+            # 그걸 늘여 배경에 구우면 화면이 깨진 것처럼 보인다(사용자 신고)
+            return part, mean, max(st.stddev[:3]) <= self.CAMO_MAX_SD
 
-        예전에는 바를 잠깐 숨기고 그 자리를 찍었는데, 그 순간이 눈에 띄었다
-        (화면 캡처 직후처럼 다시 찍을 일이 겹치면 특히). 바가 놓인 구간은
-        아이콘이 없는 매끈한 자리라, 좌우 끝을 가로로 이어 붙이면 실제와 같다.
+        left = side((0, 0, lw, h)) if lw > 0 else None
+        right = side((span.width - rw, 0, span.width, h)) if rw > 0 else None
+        return left, right
+
+    def _compose(self, left, right, w, h):
+        """매끈한 조각만으로 바 배경을 만든다 — 둘이면 가로 그라데이션.
+
+        바가 놓인 구간은 아이콘 없는 매끈한 자리라 좌우 끝을 이어 붙이면
+        실제와 같다. 예전처럼 바를 잠깐 숨기고 그 자리를 찍으면 그 순간이
+        눈에 띈다. 쓸 조각이 없으면 None.
+        """
+        from PIL import Image
+        lft = left[0].resize((w, h)) if left and left[2] else None
+        rgt = right[0].resize((w, h)) if right and right[2] else None
+        if lft is None or rgt is None:
+            return lft or rgt
+        ramp = Image.new("L", (w, 1))
+        ramp.putdata([255 * i // max(w - 1, 1) for i in range(w)])
+        return Image.composite(rgt, lft, ramp.resize((w, h)))
+
+    def _apply_camo(self, img, left, right, why):
+        """만든 배경을 입힌다 (Tk 스레드). 글자 팔레트도 밝기에 맞춘다."""
+        from PIL import ImageTk
+        self._bgimg = ImageTk.PhotoImage(img)
+        self.cv.itemconfigure(self._img_item, image=self._bgimg)
+        r, gr, b = img.resize((1, 1)).getpixel((0, 0))[:3]
+        lum = 0.299 * r + 0.587 * gr + 0.114 * b
+        pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
+        if pal is not self._pal:
+            self._pal = pal
+            self._last = [None] * (self.LINES * self.MAX_PANELS)  # 글자색 다시
+        self._camo_ref = (left[1] if left and left[2] else None,
+                          right[1] if right and right[2] else None)
+        self._camo_at = time.time()
+        self._note_painted(b)
+        # 따라가기(sync)는 게임·영상이 뒤에서 돌면 초마다 일어난다 — 로그는
+        # 분에 한 줄만. 즉시 뜬 것(now)은 원인 추적용이라 늘 남긴다
+        now = time.time()
+        if why != "sync" or now - self._camo_log_at >= 60:
+            self._camo_log_at = now
+            log.info("bar camo #%02x%02x%02x (%s)", r, gr, b, why)
+
+    def _match_background(self, force=True):
+        """지금 바 양옆을 떠서 곧바로 배경으로 입힌다 (Tk 스레드).
+
+        표시 직후·폭이 바뀐 뒤·옮긴 뒤처럼 기다리면 안 되는 순간에 부른다.
+        평소 작업표시줄 색을 따라가는 일은 _camo_loop가 한다(force는 예전
+        호출과의 호환용이다 — 이제 늘 즉시 뜬다).
         """
         if self._snip_active and self._bgimg is not None:
             return      # 캡처 오버레이로 어두워진 화면을 배경으로 찍으면 안 됨
-        if not force and time.time() - self._camo_at > self.CAMO_MAX_AGE:
-            force = True    # 옆 픽셀이 그대로여도 오래되면 한 번 다시 맞춘다
-        rgb = self._probe()
-        if rgb is None:
+        try:
+            self.root.update_idletasks()    # geometry 반영 전 winfo_x()=0 방지
+            geom = (self.root.winfo_x(), self.root.winfo_y(),
+                    self._fix_w, self._fix_h)
+            sides = self._sample_sides(geom)
+        except Exception:
+            log.exception("bg capture failed")
+            return
+        if not sides:
             # 조용히 포기하면 바가 임시 배경(#1f1f1f) 그대로 검게 남는다 —
             # 원인 추적이 되도록 창당 한 번은 남긴다. 재시도는 틱이 한다.
             if self._bgimg is None and not self._probe_warned:
                 self._probe_warned = True
-                log.info("camo probe failed at %d,%d",
-                         self.root.winfo_x(), self.root.winfo_y())
+                log.info("camo probe failed at %d,%d", geom[0], geom[1])
             return
+        left, right = sides
         if self._bgimg is None:
-            # 첫 촬영 전에도 검정을 보여주지 않는다 — 옆 픽셀 색으로 먼저 칠하고
-            # 글자 팔레트도 그 밝기에 맞춘다(촬영은 바로 아래에서 이어진다).
-            solid = "#%02x%02x%02x" % rgb
+            # 첫 촬영 전에도 검정을 보여주지 않는다 — 옆 조각 평균색으로 먼저
+            # 칠하고 글자 팔레트도 그 밝기에 맞춘다
+            m = (left or right)[1]
+            solid = "#%02x%02x%02x" % m
             self.root.configure(bg=solid)
             self.cv.configure(bg=solid)
-            lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+            lum = 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2]
             self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
-            self._note_painted(rgb[2])
-        if not force:
-            if self._rgb and \
-                    max(abs(a - b) for a, b in zip(rgb, self._rgb)) <= 3:
-                self._pending = None
-                return
-            # 새 색이 2회 연속(약 60초) 유지될 때만 재촬영 —
-            # 아이콘 점멸·알림 토스트 같은 일시 변화로 깜빡이지 않게
-            if self._pending is None or \
-                    max(abs(a - b) for a, b in zip(rgb, self._pending)) > 3:
-                self._pending = rgb
-                return
-            self._pending = None
-        self._rgb = rgb
-        try:
-            from PIL import Image, ImageGrab, ImageStat, ImageTk
-            x, y = self.root.winfo_x(), self.root.winfo_y()
-            w, h, s = self._fix_w, self._fix_h, self.SIDE
-            x0 = max(x - s, 0)
-            x1 = min(x + w + s, self.root.winfo_screenwidth())
-            lw, rw = x - x0, x1 - (x + w)
-            if lw <= 0 and rw <= 0:
-                return
-            shot = ImageGrab.grab(bbox=(x0, y, x1, y + h),
-                                  all_screens=True).convert("RGB")
+            self._note_painted(m[2])
+        img = self._compose(left, right, geom[2], geom[3])
+        if img is None:
+            # 양쪽 다 못 믿을 조각 — 쓰던 배경을 그대로 두고 다시 노린다.
+            # 폭이 막 바뀐 참이면 남은 배경은 폭이 안 맞으니 곧바로 다시
+            # 노린다. 몇 번 해도 안 되면 동기화 스레드에 맡긴다.
+            if self._camo_retry < 5:
+                self._camo_retry += 1
+                self.root.after(self.CAMO_SETTLE_MS, self._match_background)
+            log.info("camo skipped: both strips look busy (retry %d)",
+                     self._camo_retry)
+            return
+        self._camo_retry = 0
+        self._apply_camo(img, left, right, "now")
 
-            def strip(box):
-                """작업표시줄 빈 구간만 배경으로 쓴다.
+    def _apply_pending_camo(self, geom):
+        """동기화 스레드가 떠 둔 새 배경을 입힌다 — 그사이 옮기거나 폭이
+        바뀌었으면(다른 자리의 색이다) 버린다."""
+        pending, self._camo_pending = self._camo_pending, None
+        if pending is None or self._snip_active or pending[0] != geom:
+            return
+        _, img, (left, right) = pending
+        self._apply_camo(img, left, right, "sync")
 
-                바가 방금 비운 자리는 작업표시줄이 아직 다시 그리기 전이라,
-                거기엔 우리 글자가 그대로 남아 있다. 그걸 떠서 가로로 늘이면
-                배경에 글자가 구워져 화면이 깨진 것처럼 보인다(사용자 신고).
-                빈 구간은 매끈하므로, 거친 조각은 버리고 다음 기회에 다시 찍는다.
-                """
-                part = shot.crop(box)
-                if max(ImageStat.Stat(part).stddev or [0]) > self.CAMO_MAX_SD:
-                    return None
-                return part.resize((w, h))
+    def _camo_loop(self, gen):
+        """작업표시줄 색을 따라가는 동기화 스레드 — 0.5초마다 양옆만 떠 본다.
 
-            left = strip((0, 0, lw, h)) if lw > 0 else None
-            right = (strip((shot.width - rw, 0, shot.width, h))
-                     if rw > 0 else None)
-            if left is None and right is None:
-                # 양쪽 다 못 믿을 조각 — 쓰던 배경을 그대로 두고 다시 시도한다.
-                # 폭이 막 바뀐 참이면(force) 남은 배경은 폭이 안 맞으니 곧바로
-                # 다시 노린다. 몇 번 해도 안 되면 정기 확인에 맡긴다.
-                self._rgb = None
-                if force and self._camo_retry < 5:
-                    self._camo_retry += 1
-                    self.root.after(self.CAMO_SETTLE_MS,
-                                    lambda: self._match_background(force=True))
-                log.info("camo skipped: both strips look busy (retry %d)",
-                         self._camo_retry)
-                return
-            self._camo_retry = 0
-            if left is None:
-                img = right
-            elif right is None:
-                img = left
-            else:
-                ramp = Image.new("L", (w, 1))
-                ramp.putdata([255 * i // max(w - 1, 1) for i in range(w)])
-                img = Image.composite(right, left, ramp.resize((w, h)))
-            self._bgimg = ImageTk.PhotoImage(img)
-            self.cv.itemconfigure(self._img_item, image=self._bgimg)
-            r, gr, b = img.resize((1, 1)).getpixel((0, 0))[:3]
-            lum = 0.299 * r + 0.587 * gr + 0.114 * b
-            self._pal = self.PAL_LIGHT if lum >= 128 else self.PAL_DARK
-            self._last = [None] * (self.LINES * self.MAX_PANELS)
-            self._camo_at = time.time()
-            self._note_painted(b)
-            log.info("bar camo #%02x%02x%02x", r, gr, b)
-        except Exception:
-            log.exception("bg capture failed")
+        Windows 11 작업표시줄은 반투명(아크릴)이라 뒤에 있는 창에 따라 색이
+        계속 변한다 — 뒤에서 게임·영상이 돌면 매 프레임. 예전에는 10초마다
+        픽셀 넷을 보고 두 번 연속 같은 색일 때만 다시 떠서, 색이 계속
+        변하는 동안엔 최대 5분까지 옛 색으로 남았다(2026-09-23 제보: 바만
+        베이지로 떠 있음). 이제 옆 조각이 입힌 색과 1초(오른쪽은 트레이
+        아이콘 호버가 닿아 2초) 넘게 다르면 곧바로 새 배경을 만들어 둔다.
+
+        화면 읽기는 DWM 한 프레임(약 13ms)을 기다리므로 Tk 스레드에서 하지
+        않는다 — 여기서 뜨고 만들고, 입히기만 틱이 한다(_apply_pending_camo).
+        """
+        miss = [0, 0]
+        need = (self.CAMO_CONFIRM, self.CAMO_CONFIRM_RIGHT)
+        while gen == self._gen and \
+                not self.app.stop_evt.wait(self.CAMO_SYNC_SEC):
+            geom = self._camo_geom
+            if geom is None or self._camo_pending is not None:
+                continue
+            try:
+                sides = self._sample_sides(geom)
+            except Exception:
+                continue
+            if not sides:
+                continue
+            ref = self._camo_ref
+            for i, cur in enumerate(sides):
+                if cur is not None and cur[2] and ref[i] is not None and \
+                        max(abs(a - b) for a, b in zip(cur[1], ref[i])) \
+                        > self.CAMO_TOL:
+                    miss[i] += 1
+                else:
+                    miss[i] = 0
+            stale = time.time() - self._camo_at > self.CAMO_MAX_AGE
+            if not (stale or miss[0] >= need[0] or miss[1] >= need[1]):
+                continue
+            img = self._compose(sides[0], sides[1], geom[2], geom[3])
+            if img is not None:
+                self._camo_pending = (geom, img, sides)
+                miss = [0, 0]
 
     def _value_color(self, pct):
         """pct는 항상 '쓴 비율' — 표시 모드와 무관하게 위험색 기준은 같다."""
@@ -3160,6 +3249,7 @@ class FloatingBar(threading.Thread):
             full = _fullscreen_now()
             if self._shown and full:
                 u.ShowWindow(ctypes.c_void_p(self._hwnd), 0)    # SW_HIDE
+                self._camo_geom = None      # 전체화면을 배경으로 뜨지 않게
                 self._shown = False
                 self._fs_hidden = True
                 self._hide_pending_log = True   # 로그는 틱이 남긴다 (Tk 금지)
@@ -3250,13 +3340,15 @@ class FloatingBar(threading.Thread):
             self._match_background(force=True)
             self._adopt_by_taskbar()
             self._sync_topmost(raise_now=True)
+        geom = (self.root.winfo_x(), self.root.winfo_y(),
+                self._fix_w, self._fix_h)
         if self._recapture and not snip:
             self._recapture = False
             self._match_background(force=True)
-        elif self._ticks % self.CAMO_EVERY == 0:
-            self._match_background()    # 재촬영은 2회 연속 변했을 때만
         elif self._bgimg is None:
             self._match_background(force=True)  # 첫 배경을 얻기까지 매 틱 재시도
+        else:
+            self._apply_pending_camo(geom)      # 동기화 스레드가 떠 둔 새 배경
         base = 0
         for panel_idx, panel in enumerate(panels):
             lines = panel["lines"]
@@ -3279,6 +3371,11 @@ class FloatingBar(threading.Thread):
             self._poll_translation()
         self._show(True)
         self._apply_lock()
+        # 동기화 스레드가 떠 볼 자리 — 표시 뒤에 읽는다(숨은 Tk 창은 옛 좌표를
+        # 돌려준다). 캡처 오버레이 중에는 어두워진 화면을 배경으로 삼지 않게
+        # 비워 둔다
+        self._camo_geom = None if snip else (
+            self.root.winfo_x(), self.root.winfo_y(), self._fix_w, self._fix_h)
         if self._ticks % self.CAMO_EVERY == 0:
             self._health_check()
 
@@ -3332,30 +3429,11 @@ class FloatingBar(threading.Thread):
         뜬 뒤 잘라내서(실측: 840px나 370만px이나 똑같이 26.5ms, CPU 12.5ms)
         모니터가 크고 많을수록 비싸진다. 바 영역만 뜨면 CPU 0.4ms로 끝난다.
         """
-        u, g = ctypes.windll.user32, ctypes.windll.gdi32
-        sdc = mdc = bmp = None
-        try:
-            sdc = u.GetDC(0)
-            mdc = g.CreateCompatibleDC(sdc)
-            bmp = g.CreateCompatibleBitmap(sdc, w, h)
-            g.SelectObject(mdc, bmp)
-            g.BitBlt(mdc, 0, 0, w, h, sdc, x, y, SRCCOPY)
-            hdr = BITMAPINFOHEADER()
-            hdr.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            hdr.biWidth, hdr.biHeight = w, -h       # 음수 = 위에서 아래로
-            hdr.biPlanes, hdr.biBitCount = 1, 32
-            buf = ctypes.create_string_buffer(w * h * 4)
-            if not g.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(hdr), 0):
-                return None
-        finally:
-            if bmp:
-                g.DeleteObject(bmp)
-            if mdc:
-                g.DeleteDC(mdc)
-            if sdc:
-                u.ReleaseDC(0, sdc)
+        raw = blit_bgra(x, y, w, h)
+        if raw is None:
+            return None
         # 한 채널만 잘라 C 속도로 min/max — 알파는 고정값이라 건너뛴다
-        chan = buf.raw[0::4]
+        chan = raw[0::4]
         return (min(chan), max(chan)) if chan else None
 
     def _health_check(self):
@@ -3496,6 +3574,7 @@ class FloatingBar(threading.Thread):
             # 바 양옆을 뜨는 방식이라 바가 보이는 채로 찍어도 된다(v2.16).
             self._match_background(force=True)
         elif not on and self._shown:
+            self._camo_geom = None      # 숨은 동안은 배경을 떠 보지 않는다
             self._win_show(False)
         elif on and self._ticks % self.ADOPT_EVERY == 0:
             self._adopt_by_taskbar()    # 연결이 풀린 경우를 위한 드문 보험

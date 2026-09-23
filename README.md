@@ -6,7 +6,7 @@
 
 [![Platform](https://img.shields.io/badge/Windows%2010%2F11-0078d4?style=flat-square)](#설치)
 [![Runtime](https://img.shields.io/badge/Standalone_EXE-no_Python-2ea043?style=flat-square)](#설치)
-[![Version](https://img.shields.io/badge/version-v3.18.3-d97757?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v3.18.4-d97757?style=flat-square)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-6e7681?style=flat-square)](LICENSE)
 
 **[설치](#설치)** · **[업데이트 알림](#업데이트-알림)** · **[화면 구성](#화면-구성)** · **[루틴 알림](#루틴-알림)** · **[스킬 집계](#스킬-집계)** · **[개인정보](#네트워크와-개인정보)** · **[패치 이력](CHANGELOG.md)**
@@ -111,6 +111,9 @@ PowerShell에서 바로 돌리려면 `powershell -ExecutionPolicy Bypass -File .
 
 - 바는 **오른쪽 끝(트레이 쪽)이 앵커** — 알림 패널이 나타났다 사라져도 사용량
   패널은 제자리, 바가 바깥쪽으로만 늘었다 줄어듭니다. 패널 폭은 내용 맞춤.
+- 배경은 바 양옆 작업표시줄을 0.5초마다 확인해 **1초 안에** 같은 색으로
+  맞춥니다 — 반투명 작업표시줄이 뒤의 창·게임에 따라 색이 바뀌어도 따라가고,
+  바가 숨어 있는 동안(전체화면)은 화면을 읽지 않습니다.
 - Codex 값은 Codex 로그인(auth.json)으로 **공식 사용량을 직접 조회**합니다.
   조회가 안 되면(오프라인·토큰 만료) 세션 로그의 마지막 기록으로 폴백하며,
   이 값은 과거 기록이라 실제와 다를 수 있습니다.
